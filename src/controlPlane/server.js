@@ -1,0 +1,217 @@
+// Control plane — the internal portal. Zero-dependency node:http server.
+//
+// Endpoints (all admin endpoints require Authorization: Bearer <CONTROL_PLANE_TOKEN>):
+//   GET  /health                      -> liveness
+//   GET  /api/accounts                -> list (secrets redacted) + live status
+//   POST /api/accounts                -> add/update an account, then orchestrator.sync()
+//   POST /api/accounts/:id/activate   -> { active:boolean }, then sync()
+//   DELETE /api/accounts/:id          -> remove, then sync()
+//   POST /webhooks/gmail              -> Pub/Sub push (verification token in query)
+//   GET  /api/accounts/:id/gmail/auth-url -> OAuth consent URL for this account
+//   GET  /oauth/google/callback           -> exchange code -> store refresh token + watch
+//
+// "More creds = more bots": every account mutation calls orchestrator.sync(),
+// which brings the worker fleet in line with the active accounts.
+import http from 'node:http';
+import { URL } from 'node:url';
+import { logger } from '../util/logger.js';
+import {
+  buildGoogleAuthUrl,
+  exchangeCodeForTokens,
+  encodeOAuthState,
+  decodeOAuthState,
+} from '../gmail/oauth.js';
+import { connectGmailAccount } from '../gmail/connect.js';
+
+const log = logger('control-plane');
+
+export function createControlPlane({ store, orchestrator, gmailWatcher, config = {} }) {
+  const adminToken = config.adminToken || process.env.CONTROL_PLANE_TOKEN;
+  const pubsubToken = config.pubsubToken || process.env.GMAIL_PUBSUB_VERIFICATION_TOKEN;
+  const oauthClientId = config.oauthClientId || process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const oauthClientSecret = config.oauthClientSecret || process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const oauthRedirectUri =
+    config.oauthRedirectUri ||
+    process.env.GOOGLE_OAUTH_REDIRECT_URI ||
+    'http://localhost:8787/oauth/google/callback';
+  const pubsubTopic = config.pubsubTopic || process.env.GMAIL_PUBSUB_TOPIC;
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const path = u.pathname;
+      const method = req.method;
+
+      if (method === 'GET' && path === '/health') {
+        return json(res, 200, { ok: true, live: orchestrator.status().length });
+      }
+
+      // ── Gmail Pub/Sub push (auth via verification token in the query) ────────
+      if (method === 'POST' && path === '/webhooks/gmail') {
+        if (pubsubToken && u.searchParams.get('token') !== pubsubToken) {
+          return json(res, 401, { error: 'bad pubsub token' });
+        }
+        const body = await readJson(req);
+        // Ack fast (Pub/Sub retries on non-2xx); process async.
+        json(res, 204, null);
+        if (gmailWatcher) {
+          gmailWatcher.handlePush(body).catch((e) => log.warn('gmail push error', { err: String(e) }));
+        }
+        return;
+      }
+
+      // ── OAuth callback (Google redirects here after user consent) ─────────────
+      if (method === 'GET' && path === '/oauth/google/callback') {
+        const err = u.searchParams.get('error');
+        if (err) return html(res, 400, oauthResultPage(false, `Google OAuth denied: ${err}`));
+        const code = u.searchParams.get('code');
+        const state = u.searchParams.get('state');
+        if (!code || !state) return html(res, 400, oauthResultPage(false, 'Missing code or state'));
+        try {
+          if (!oauthClientId || !oauthClientSecret) {
+            throw new Error('GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET not configured');
+          }
+          const { accountId } = decodeOAuthState(state);
+          const tokens = await exchangeCodeForTokens({
+            clientId: oauthClientId,
+            clientSecret: oauthClientSecret,
+            code,
+            redirectUri: oauthRedirectUri,
+          });
+          if (!tokens.refresh_token) {
+            throw new Error('No refresh_token returned — revoke app access in Google Account and retry');
+          }
+          const connected = await connectGmailAccount({
+            store,
+            gmailWatcher,
+            accountId,
+            refreshToken: tokens.refresh_token,
+            topicName: pubsubTopic,
+          });
+          await orchestrator.sync();
+          return html(
+            res,
+            200,
+            oauthResultPage(true, `Gmail connected: ${connected.emailAddress}. You can close this tab.`)
+          );
+        } catch (e) {
+          log.error('oauth callback failed', { err: String(e) });
+          return html(res, 500, oauthResultPage(false, String(e.message || e)));
+        }
+      }
+
+      // ── Everything below requires the admin token ───────────────────────────
+      if (!authorized(req, adminToken)) return json(res, 401, { error: 'unauthorized' });
+
+      if (method === 'GET' && path === '/api/accounts') {
+        const accounts = await store.list();
+        const status = orchestrator.status();
+        return json(res, 200, {
+          accounts: accounts.map(redact),
+          live: status,
+        });
+      }
+
+      if (method === 'POST' && path === '/api/accounts') {
+        const body = await readJson(req);
+        if (!body.portalBaseUrl || !body.portalUsername || !body.portalPassword) {
+          return json(res, 400, { error: 'portalBaseUrl, portalUsername, portalPassword required' });
+        }
+        const id = await store.upsert(body);
+        await orchestrator.sync();
+        return json(res, 201, { id, live: orchestrator.status().length });
+      }
+
+      let m;
+      if (method === 'POST' && (m = path.match(/^\/api\/accounts\/([^/]+)\/activate$/))) {
+        const body = await readJson(req);
+        const ok = await store.setActive(m[1], body.active !== false);
+        await orchestrator.sync();
+        return json(res, ok ? 200 : 404, { ok, live: orchestrator.status().length });
+      }
+
+      if (method === 'DELETE' && (m = path.match(/^\/api\/accounts\/([^/]+)$/))) {
+        const ok = await store.remove(m[1]);
+        await orchestrator.sync();
+        return json(res, ok ? 200 : 404, { ok, live: orchestrator.status().length });
+      }
+
+      if (method === 'GET' && (m = path.match(/^\/api\/accounts\/([^/]+)\/gmail\/auth-url$/))) {
+        const account = await store.get(m[1]);
+        if (!account) return json(res, 404, { error: 'account not found' });
+        if (!oauthClientId) return json(res, 400, { error: 'GOOGLE_OAUTH_CLIENT_ID not configured' });
+        const state = encodeOAuthState(account.id);
+        const url = buildGoogleAuthUrl({
+          clientId: oauthClientId,
+          redirectUri: oauthRedirectUri,
+          state,
+        });
+        return json(res, 200, { url, accountId: account.id });
+      }
+
+      return json(res, 404, { error: 'not found' });
+    } catch (e) {
+      log.error('request error', { err: String(e) });
+      const msg = e?.message || String(e);
+      const status = /not set|not configured|required|invalid/i.test(msg) ? 400 : 500;
+      return json(res, status, { error: msg });
+    }
+  });
+
+  return server;
+}
+
+function authorized(req, token) {
+  if (!token) return true; // no token configured = open (dev only)
+  const h = req.headers['authorization'] || '';
+  return h === `Bearer ${token}`;
+}
+
+function redact(a) {
+  const { portalPassword, gmailRefreshToken, ...rest } = a;
+  return { ...rest, portalPassword: '***', gmailRefreshToken: gmailRefreshToken ? '***' : undefined };
+}
+
+function json(res, status, obj) {
+  if (status === 204 || obj === null) {
+    res.writeHead(status);
+    return res.end();
+  }
+  const payload = JSON.stringify(obj);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
+  res.end(payload);
+}
+
+function html(res, status, body) {
+  const payload = typeof body === 'string' ? body : String(body);
+  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(payload) });
+  res.end(payload);
+}
+
+function oauthResultPage(ok, message) {
+  const color = ok ? '#059669' : '#dc2626';
+  const title = ok ? 'Gmail Connected' : 'Gmail Connection Failed';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title>
+    <style>body{font-family:Inter,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;background:#f1f5f9;margin:0}
+    .card{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:480px;text-align:center}
+    h1{color:${color};font-size:22px}</style></head><body><div class="card"><h1>${title}</h1><p>${message}</p></div></body></html>`;
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (!raw) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch (e) {
+        reject(new Error('invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+export default createControlPlane;

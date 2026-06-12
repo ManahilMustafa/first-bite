@@ -1,0 +1,27 @@
+{
+  "name": "estreet-bot",
+  "version": "1.0.0",
+  "description": "Multi-account auto-accept bot for E-Street / ValueLink AMS appraisal orders",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "control-plane": "node src/controlPlane/server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "test:watch": "node --test --watch \"test/*.test.js\""
+  },
+  "keywords": [
+    "estreet",
+    "valuelink",
+    "appraisal",
+    "automation"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
+  "optionalDependencies": {
+    "redis": "^4.7.0"
+  }
+}
