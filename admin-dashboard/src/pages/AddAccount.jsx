@@ -8,7 +8,7 @@ const initialForm = {
   portalUsername: '',
   portalPassword: '',
   portalBaseUrl: '',
-  gmailAddress: '',
+  forwardingEmail: '',
   pollIntervalMs: '2000',
   regionZipPrefixes: '',
   regionStates: '',
@@ -37,8 +37,8 @@ export function AddAccount() {
       pollIntervalMs: Number(form.pollIntervalMs) || 2000,
     }
 
-    if (form.gmailAddress.trim()) {
-      payload.gmailAddress = form.gmailAddress.trim()
+    if (form.forwardingEmail.trim()) {
+      payload.forwardingEmail = form.forwardingEmail.trim().toLowerCase()
     }
 
     const zipPrefixes = parseCsvList(form.regionZipPrefixes)
@@ -114,14 +114,18 @@ export function AddAccount() {
               />
             </div>
             <div className="form-field">
-              <label htmlFor="gmailAddress">Gmail Address</label>
+              <label htmlFor="forwardingEmail">Forwarding Email</label>
               <input
-                id="gmailAddress"
+                id="forwardingEmail"
                 type="email"
-                value={form.gmailAddress}
-                onChange={(e) => updateField('gmailAddress', e.target.value)}
-                placeholder="you@gmail.com (optional)"
+                value={form.forwardingEmail}
+                onChange={(e) => updateField('forwardingEmail', e.target.value)}
+                placeholder="address orders arrive at (e.g. you@gmail.com)"
               />
+              <span className="field-hint">
+                The mailbox this user's order emails are forwarded FROM — used to route
+                forwarded emails to this account.
+              </span>
             </div>
             <div className="form-field">
               <label htmlFor="pollIntervalMs">Poll Interval (ms)</label>

@@ -19,10 +19,14 @@ const SECRET_FIELDS = ['portalPassword', 'gmailRefreshToken'];
  * @property {string} portalBaseUrl
  * @property {string} portalUsername
  * @property {string} portalPassword          (encrypted on disk)
+ * @property {string} [forwardingEmail]       the user's mailbox orders arrive at;
+ *                                            the attribution key for forwarded email
  * @property {string} [gmailAddress]
- * @property {string} [gmailRefreshToken]     (encrypted on disk)
+ * @property {string} [gmailRefreshToken]     (encrypted on disk; legacy per-account)
  * @property {string} [historyId]
  * @property {number} [pollIntervalMs]
+ * @property {string[]} [regionZipPrefixes]   e.g. ["32","33","34"]
+ * @property {string[]} [regionStates]        e.g. ["FL"] or ["TX"]
  * @property {object} [portalRoutes]
  * @property {object} [portalFields]
  */
@@ -62,12 +66,34 @@ export class AccountsStore {
     return (await this.list()).find((a) => a.id === id) || null;
   }
 
-  /** Add or replace an account (secrets encrypted before write). */
+  /** Find the active account registered for a forwarding address (case-insensitive). */
+  async findByForwardingEmail(email) {
+    if (!email) return null;
+    const needle = String(email).trim().toLowerCase();
+    return (await this.list()).find((a) => a.active && a.forwardingEmail === needle) || null;
+  }
+
+  /**
+   * Add or replace an account (secrets encrypted before write).
+   * @throws if `forwardingEmail` is already registered to a DIFFERENT account —
+   * a shared key would silently misattribute forwarded orders to the wrong user.
+   */
   async upsert(account) {
     const raw = await this._readRaw();
     const id = account.id || randomUUID();
+    // Normalize the attribution key so header matching (which lowercases) lines up.
+    const normalized = { ...account };
+    if (normalized.forwardingEmail) {
+      normalized.forwardingEmail = String(normalized.forwardingEmail).trim().toLowerCase();
+      const clash = raw.find((a) => a.id !== id && a.forwardingEmail === normalized.forwardingEmail);
+      if (clash) {
+        throw new Error(
+          `forwardingEmail ${normalized.forwardingEmail} is already registered to account ${clash.id}`
+        );
+      }
+    }
     const record = encryptFields(
-      { active: true, pollIntervalMs: undefined, ...account, id },
+      { active: true, pollIntervalMs: undefined, ...normalized, id },
       SECRET_FIELDS,
       this.key
     );
@@ -83,16 +109,6 @@ export class AccountsStore {
     const idx = raw.findIndex((a) => a.id === id);
     if (idx === -1) return false;
     raw[idx].active = active;
-    await this._writeRaw(raw);
-    return true;
-  }
-
-  /** Persist an advanced Gmail historyId cursor for an account (by gmail address). */
-  async saveHistoryId(gmailAddress, historyId) {
-    const raw = await this._readRaw();
-    const idx = raw.findIndex((a) => a.gmailAddress === gmailAddress);
-    if (idx === -1) return false;
-    raw[idx].historyId = historyId;
     await this._writeRaw(raw);
     return true;
   }

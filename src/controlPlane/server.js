@@ -19,13 +19,12 @@ import {
   buildGoogleAuthUrl,
   exchangeCodeForTokens,
   encodeOAuthState,
-  decodeOAuthState,
 } from '../gmail/oauth.js';
-import { connectGmailAccount } from '../gmail/connect.js';
+import { connectCentralGmail } from '../gmail/connect.js';
 
 const log = logger('control-plane');
 
-export function createControlPlane({ store, orchestrator, gmailWatcher, config = {} }) {
+export function createControlPlane({ store, orchestrator, gmailWatcher, connectionStore, eventsStore, config = {} }) {
   const adminToken = config.adminToken || process.env.CONTROL_PLANE_TOKEN;
   const pubsubToken = config.pubsubToken || process.env.GMAIL_PUBSUB_VERIFICATION_TOKEN;
   const oauthClientId = config.oauthClientId || process.env.GOOGLE_OAUTH_CLIENT_ID;
@@ -51,16 +50,24 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, config =
         if (pubsubToken && u.searchParams.get('token') !== pubsubToken) {
           return json(res, 401, { error: 'bad pubsub token' });
         }
-        const body = await readJson(req);
-        // Ack fast (Pub/Sub retries on non-2xx); process async.
-        json(res, 204, null);
+        // ALWAYS ack 2xx — a non-2xx makes Pub/Sub retry forever, so a malformed
+        // body must not bubble to the outer 4xx/5xx handler. Parse defensively.
+        let body;
+        try {
+          body = await readJson(req);
+        } catch (e) {
+          log.warn('invalid gmail push body', { err: String(e) });
+          return json(res, 204, null);
+        }
+        json(res, 204, null); // ack fast, process async
         if (gmailWatcher) {
           gmailWatcher.handlePush(body).catch((e) => log.warn('gmail push error', { err: String(e) }));
         }
         return;
       }
 
-      // ── OAuth callback (Google redirects here after user consent) ─────────────
+      // ── OAuth callback (Google redirects here after operator consent) ─────────
+      // Connects the ONE central inbox all users forward into.
       if (method === 'GET' && path === '/oauth/google/callback') {
         const err = u.searchParams.get('error');
         if (err) return html(res, 400, oauthResultPage(false, `Google OAuth denied: ${err}`));
@@ -71,7 +78,7 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, config =
           if (!oauthClientId || !oauthClientSecret) {
             throw new Error('GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET not configured');
           }
-          const { accountId } = decodeOAuthState(state);
+          if (!connectionStore) throw new Error('Gmail connection store not configured');
           const tokens = await exchangeCodeForTokens({
             clientId: oauthClientId,
             clientSecret: oauthClientSecret,
@@ -81,18 +88,16 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, config =
           if (!tokens.refresh_token) {
             throw new Error('No refresh_token returned — revoke app access in Google Account and retry');
           }
-          const connected = await connectGmailAccount({
-            store,
+          const connected = await connectCentralGmail({
+            connectionStore,
             gmailWatcher,
-            accountId,
             refreshToken: tokens.refresh_token,
             topicName: pubsubTopic,
           });
-          await orchestrator.sync();
           return html(
             res,
             200,
-            oauthResultPage(true, `Gmail connected: ${connected.emailAddress}. You can close this tab.`)
+            oauthResultPage(true, `Central inbox connected: ${connected.emailAddress}. You can close this tab.`)
           );
         } catch (e) {
           log.error('oauth callback failed', { err: String(e) });
@@ -117,7 +122,16 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, config =
         if (!body.portalBaseUrl || !body.portalUsername || !body.portalPassword) {
           return json(res, 400, { error: 'portalBaseUrl, portalUsername, portalPassword required' });
         }
-        const id = await store.upsert(body);
+        let id;
+        try {
+          id = await store.upsert(body);
+        } catch (e) {
+          // Duplicate forwardingEmail (or other upsert rejection) — 409 Conflict.
+          if (/already registered/i.test(String(e.message))) {
+            return json(res, 409, { error: String(e.message) });
+          }
+          throw e;
+        }
         await orchestrator.sync();
         return json(res, 201, { id, live: orchestrator.status().length });
       }
@@ -136,17 +150,92 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, config =
         return json(res, ok ? 200 : 404, { ok, live: orchestrator.status().length });
       }
 
-      if (method === 'GET' && (m = path.match(/^\/api\/accounts\/([^/]+)\/gmail\/auth-url$/))) {
-        const account = await store.get(m[1]);
-        if (!account) return json(res, 404, { error: 'account not found' });
+      // Orders feed — every detected order + its outcome (newest first).
+      if (method === 'GET' && path === '/api/orders') {
+        if (!eventsStore) return json(res, 200, { orders: [] });
+        const limit = Math.min(Number(u.searchParams.get('limit')) || 100, 1000);
+        const accountId = u.searchParams.get('accountId') || undefined;
+        const action = u.searchParams.get('action') || undefined;
+        const orders = await eventsStore.list({ limit, accountId, action });
+        return json(res, 200, { orders });
+      }
+
+      // Per-user statistics over rolling day / week / month windows.
+      if (method === 'GET' && path === '/api/stats') {
+        if (!eventsStore) return json(res, 200, { overall: {}, byAccount: [] });
+        return json(res, 200, await eventsStore.stats());
+      }
+
+      // Backfill: scan recent inbox order emails and record any not already in the
+      // feed. Detection-only — it does NOT accept or decline anything.
+      if (method === 'POST' && path === '/api/orders/scan') {
+        if (!eventsStore || !gmailWatcher) return json(res, 400, { error: 'orders/gmail not configured' });
+        const max = Math.min(Number(u.searchParams.get('max')) || 50, 200);
+        const q = u.searchParams.get('q') || 'subject:"accept or decline order"';
+        const report = await gmailWatcher.dryRunRecent({ max, query: q });
+        const seen = await eventsStore.recordedKeys();
+        let recorded = 0;
+        for (const o of report.orders) {
+          const key = `${o.accountId || ''}:${o.orderId}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const unatt = o.decision === 'unattributed';
+          const cand = (o.unmatchedCandidates && o.unmatchedCandidates[0]) || null;
+          await eventsStore.record({
+            accountId: o.accountId || null,
+            account: unatt ? '(unattributed)' : o.attributedTo || null,
+            orderId: o.orderId,
+            source: 'gmail',
+            action: unatt ? 'unattributed' : 'detected',
+            accepted: false,
+            declined: false,
+            outcome: unatt
+              ? 'unattributed'
+              : o.decision === 'WOULD_ACCEPT'
+                ? 'would_accept'
+                : o.decision === 'WOULD_DECLINE'
+                  ? 'would_decline'
+                  : 'skip',
+            via: unatt ? cand?.via || null : o.via || null,
+            forwardingEmail: unatt ? cand?.address || null : o.forwardingEmail || null,
+            address: o.address || null,
+            state: o.state || null,
+            zip: o.zip || null,
+          });
+          recorded++;
+        }
+        return json(res, 200, { scanned: report.scanned, recorded });
+      }
+
+      // Central-inbox Gmail connection (ONE for the whole system, not per-account).
+      if (method === 'GET' && path === '/api/gmail/auth-url') {
         if (!oauthClientId) return json(res, 400, { error: 'GOOGLE_OAUTH_CLIENT_ID not configured' });
-        const state = encodeOAuthState(account.id);
         const url = buildGoogleAuthUrl({
           clientId: oauthClientId,
           redirectUri: oauthRedirectUri,
-          state,
+          state: encodeOAuthState('central'),
         });
-        return json(res, 200, { url, accountId: account.id });
+        return json(res, 200, { url });
+      }
+
+      if (method === 'GET' && path === '/api/gmail/status') {
+        const conn = connectionStore ? await connectionStore.get() : null;
+        return json(res, 200, {
+          connected: !!conn,
+          emailAddress: conn?.emailAddress,
+          historyId: conn?.historyId,
+          watchExpiration: conn?.watchExpiration,
+        });
+      }
+
+      // SAFE TEST: report what the bot WOULD do for recent inbox orders — no
+      // portal accept/decline is performed. Needs the inbox connected.
+      if (method === 'GET' && path === '/api/gmail/dry-run') {
+        if (!gmailWatcher) return json(res, 400, { error: 'gmail watcher not configured' });
+        const max = Number(u.searchParams.get('max')) || 10;
+        const q = u.searchParams.get('q');
+        const report = await gmailWatcher.dryRunRecent({ max, ...(q ? { query: q } : {}) });
+        return json(res, 200, report);
       }
 
       return json(res, 404, { error: 'not found' });

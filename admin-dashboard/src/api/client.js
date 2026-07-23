@@ -48,8 +48,29 @@ export async function deleteAccount(id) {
   return data
 }
 
-export async function getGmailAuthUrl(accountId) {
-  const { data } = await client.get(`/api/accounts/${accountId}/gmail/auth-url`)
+// Central inbox: ONE Gmail connection for the whole system (all users forward here).
+export async function getGmailAuthUrl() {
+  const { data } = await client.get('/api/gmail/auth-url')
+  return data
+}
+
+export async function getGmailStatus() {
+  const { data } = await client.get('/api/gmail/status')
+  return data
+}
+
+export async function getOrders(params = {}) {
+  const { data } = await client.get('/api/orders', { params })
+  return data
+}
+
+export async function getStats() {
+  const { data } = await client.get('/api/stats')
+  return data
+}
+
+export async function scanInbox() {
+  const { data } = await client.post('/api/orders/scan')
   return data
 }
 

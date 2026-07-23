@@ -96,6 +96,7 @@ export function Dashboard() {
                 <div className="worker-stats">
                   <span>Detected: {w.stats?.detected ?? 0}</span>
                   <span>Accepted: {w.stats?.accepted ?? 0}</span>
+                  <span>Declined: {w.stats?.declined ?? 0}</span>
                   <span>Polls: {w.pollerStats?.polls ?? 0}</span>
                 </div>
               </div>

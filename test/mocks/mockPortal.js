@@ -65,6 +65,9 @@ export class MockPortal {
   emailAcceptUrl(id) {
     return `${this.baseUrl}/accept.aspx?order=${encodeURIComponent(id)}&token=${this.orderTokens.get(id).token}`;
   }
+  emailDeclineUrl(id) {
+    return `${this.baseUrl}/decline.aspx?order=${encodeURIComponent(id)}&token=${this.orderTokens.get(id).token}`;
+  }
   orderStatus(id) {
     return this.orders.get(id)?.status;
   }
@@ -90,6 +93,25 @@ export class MockPortal {
     order.acceptedBy = who;
     order.acceptedVia = via;
     this.acceptAttempts.push({ via, orderId: id, won: true });
+    return { ok: true };
+  }
+
+  // ── core: decline ───────────────────────────────────────────────────────────
+  _tryDecline(id, who, via) {
+    const order = this.orders.get(id);
+    if (!order) {
+      this.acceptAttempts.push({ via, orderId: id, won: false, reason: 'not_found', action: 'decline' });
+      return { ok: false, reason: 'not_found' };
+    }
+    if (order.status === 'accepted') {
+      // Already taken by someone — nothing to decline.
+      this.acceptAttempts.push({ via, orderId: id, won: false, reason: 'taken', action: 'decline' });
+      return { ok: false, reason: 'taken' };
+    }
+    order.status = 'declined';
+    order.declinedBy = who;
+    order.declinedVia = via;
+    this.acceptAttempts.push({ via, orderId: id, won: true, action: 'decline' });
     return { ok: true };
   }
 
@@ -135,12 +157,20 @@ export class MockPortal {
       if (!this.issuedViewstate.has(body.__VIEWSTATE) || !this.issuedEventval.has(body.__EVENTVALIDATION)) {
         return html(res, 200, this._messagePage('Your session has expired. Please refresh.'));
       }
-      const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(body.__EVENTTARGET);
+      const target = body.__EVENTTARGET || '';
+      const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(target);
       // Test hook: simulate a rival accepting between this client's GET and POST.
       if (this._onBeforeAccept) {
         const hook = this._onBeforeAccept;
         this._onBeforeAccept = null;
         hook(orderId);
+      }
+      if (/decline|reject/i.test(target)) {
+        const d = this._tryDecline(orderId, sessionUser, 'portal');
+        if (d.ok) return html(res, 200, this._messagePage(`Order ${orderId} declined.`));
+        if (d.reason === 'taken')
+          return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+        return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
       }
       const r = this._tryAccept(orderId, sessionUser, 'portal');
       if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
@@ -181,6 +211,19 @@ export class MockPortal {
       if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
       if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
+    }
+
+    // Email decline link
+    if (path === '/decline.aspx' && req.method === 'GET') {
+      const id = u.searchParams.get('order');
+      const token = u.searchParams.get('token');
+      if (this.emailLinkMode === 'needs_login') return redirectToLogin(res);
+      const rec = this.orderTokens.get(id);
+      if (!rec || token !== rec.token) return html(res, 403, this._messagePage('Invalid token.'));
+      const r = this._tryDecline(id, rec.user, 'email');
+      if (r.ok) return html(res, 200, this._messagePage(`Order ${id} declined. Thank you.`));
+      if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
+      return html(res, 404, this._messagePage(`Order ${id} not found.`));
     }
 
     // Status page (verifier)

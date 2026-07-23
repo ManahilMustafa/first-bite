@@ -68,18 +68,18 @@ export async function acceptViaPortal({
  * accept control if rows aren't separable.
  */
 export function locateAcceptForOrder(html, orderId, acceptLabel = /accept/i) {
-  const idx = orderId ? html.indexOf(orderId) : -1;
-  if (idx !== -1) {
+  if (orderId) {
+    const idx = html.indexOf(orderId);
+    // Order not on the page (e.g. already taken/removed) → do NOT fall back to a
+    // page-global control: that would accept a DIFFERENT order. Return null.
+    if (idx === -1) return null;
     // Search a window after the order id for the nearest accept control.
-    const window = html.slice(idx, idx + 4000);
-    const local = findPostbackTarget(window, acceptLabel);
+    const local = findPostbackTarget(html.slice(idx, idx + 4000), acceptLabel);
     if (local) return local;
     // Some layouts put the button before the id; widen backwards too.
-    const wide = html.slice(Math.max(0, idx - 2000), idx + 4000);
-    const w = findPostbackTarget(wide, acceptLabel);
-    if (w) return w;
+    return findPostbackTarget(html.slice(Math.max(0, idx - 2000), idx + 4000), acceptLabel);
   }
-  // Single-order page: just take the page's accept control.
+  // No order id given (single-order page): take the page's accept control.
   return findPostbackTarget(html, acceptLabel);
 }
 

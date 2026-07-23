@@ -98,9 +98,14 @@ export class Orchestrator {
     return worker.handleOrder(order);
   }
 
-  getWorkerByGmail(gmailAddress) {
+  getWorker(accountId) {
+    return this.workers.get(accountId) || null;
+  }
+
+  getWorkerByForwardingEmail(forwardingEmail) {
+    const needle = String(forwardingEmail || '').toLowerCase();
     for (const w of this.workers.values()) {
-      if (w.account.gmailAddress === gmailAddress) return w;
+      if ((w.account.forwardingEmail || '').toLowerCase() === needle) return w;
     }
     return null;
   }

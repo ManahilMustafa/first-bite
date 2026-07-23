@@ -11,6 +11,7 @@
 // already won the lock for `orderId`.
 import { acceptViaEmailLink } from './emailAccept.js';
 import { acceptViaPortal } from './portalAccept.js';
+import { tagResult, firstSuccessOrAll } from './race.js';
 import { logger } from '../util/logger.js';
 
 /**
@@ -37,12 +38,12 @@ export async function executeAccept({
 
   if (acceptUrl) {
     tasks.push(
-      tag('email', acceptViaEmailLink({ acceptUrl, http: session?.http }))
+      tagResult('email', acceptViaEmailLink({ acceptUrl, http: session?.http }))
     );
   }
   if (session) {
     tasks.push(
-      tag('portal', acceptViaPortal({ session, orderId, ...portalOpts }))
+      tagResult('portal', acceptViaPortal({ session, orderId, ...portalOpts }))
     );
   }
 
@@ -94,40 +95,6 @@ export async function executeAccept({
 
   log.info('accept result', { orderId, accepted, via, outcome, ms: Math.round(durationMs), verified });
   return { accepted, via, outcome, durationMs, paths, verified };
-}
-
-/** Attach a name to a promise result. */
-function tag(name, promise) {
-  return promise.then(
-    (r) => ({ ...r, __name: name }),
-    (err) => ({ ok: false, outcome: 'error', __name: name, error: String(err) })
-  );
-}
-
-/**
- * Resolve with the first result for which `isWin(name,result)` is true; if none
- * win, resolve with the all-settled "best" result (first non-error, else first).
- */
-async function firstSuccessOrAll(tasks, onSettle) {
-  return new Promise((resolve) => {
-    let remaining = tasks.length;
-    const all = [];
-    let resolved = false;
-    for (const t of tasks) {
-      t.then((result) => {
-        all.push(result);
-        const win = onSettle(result.__name, result);
-        if (win && !resolved) {
-          resolved = true;
-          resolve(result);
-        }
-        if (--remaining === 0 && !resolved) {
-          resolved = true;
-          resolve(all.find((r) => r && r.outcome !== 'error') || all[0] || null);
-        }
-      });
-    }
-  });
 }
 
 export default executeAccept;

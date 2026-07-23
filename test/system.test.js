@@ -56,12 +56,48 @@ test('store setActive/listActive/remove behave', async () => {
   assert.equal((await store.list()).length, 0);
 });
 
-test('store advances Gmail historyId by address', async () => {
+test('findByForwardingEmail returns only the ACTIVE matching account (case-insensitive)', async () => {
   const store = newStore();
-  await store.upsert({ label: 'a', portalBaseUrl: 'x', portalUsername: 'u', portalPassword: 'p', gmailAddress: 'g@x.com' });
-  assert.equal(await store.saveHistoryId('g@x.com', '777'), true);
-  const acct = (await store.list()).find((a) => a.gmailAddress === 'g@x.com');
-  assert.equal(acct.historyId, '777');
+  const id = await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'x',
+    portalUsername: 'u',
+    portalPassword: 'p',
+    forwardingEmail: 'Vendor@Gmail.com',
+  });
+  // Stored lowercased; matched case-insensitively.
+  assert.equal((await store.findByForwardingEmail('vendor@gmail.com'))?.id, id);
+  assert.equal((await store.findByForwardingEmail('VENDOR@GMAIL.COM'))?.id, id);
+
+  // Deactivated → no longer attributable.
+  await store.setActive(id, false);
+  assert.equal(await store.findByForwardingEmail('vendor@gmail.com'), null);
+});
+
+test('upsert rejects a duplicate forwardingEmail on a different account', async () => {
+  const store = newStore();
+  await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'x',
+    portalUsername: 'u1',
+    portalPassword: 'p',
+    forwardingEmail: 'shared@gmail.com',
+  });
+  await assert.rejects(
+    () =>
+      store.upsert({
+        label: 'b',
+        portalBaseUrl: 'x',
+        portalUsername: 'u2',
+        portalPassword: 'p',
+        forwardingEmail: 'SHARED@gmail.com', // same key, different case
+      }),
+    /already registered/i
+  );
+  // Updating the SAME account keeps its own forwardingEmail (no false clash).
+  const id = (await store.findByForwardingEmail('shared@gmail.com')).id;
+  await store.upsert({ id, label: 'a2', portalBaseUrl: 'x', portalUsername: 'u1', portalPassword: 'p', forwardingEmail: 'shared@gmail.com' });
+  assert.equal((await store.findByForwardingEmail('shared@gmail.com')).label, 'a2');
 });
 
 // ── orchestrator: "more creds = more bots" ──────────────────────────────────--

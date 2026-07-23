@@ -71,7 +71,12 @@ The control plane is the same UX — it's just access-gated to the operator.
 - **Gmail Pub/Sub** is *redundancy only*. Email delivery + Pub/Sub tail latency
   are inherently seconds, so it can never be the millisecond path — but it
   catches orders even if portal polling is throttled, and it carries the email's
-  self-contained ACCEPT link (Path A).
+  self-contained ACCEPT/DECLINE links (Path A). It is now a **single central
+  inbox**: every user forwards their order emails into one operator-owned mailbox
+  (one OAuth token, one `users.watch`). Each forwarded email is **attributed** to
+  the user it came from by matching a recipient address in its forwarding headers
+  (`src/detect/attribution.js`) against that account's `forwardingEmail`; an order
+  that can't be attributed is quarantined, never acted on.
 - **WebSocket/SignalR** (not yet wired — gated by unknown #2): if the ASP.NET
   dashboard pushes new-order events over a live socket, subscribing to it gives
   true ~tens-of-ms detection with no polling. Add it as the primary detector if
@@ -84,10 +89,20 @@ guarantees the first to acquire proceeds; everyone else no-ops. After a
 can't re-fire. The in-memory lock matches Redis semantics for single-process /
 test use; switch to Redis (`LOCK_BACKEND=redis`) for a multi-process fleet.
 
+### Region gate: accept in-region, decline out-of-region
+Before any action, the worker applies *that user's* region rule
+(`regionZipPrefixes` / `regionStates`). In-region orders are accepted; out-of-region
+orders with a concrete ZIP/state are **actively declined** (the same race shape,
+over the DECLINE link / portal Decline postback — `declineExecutor.js`); orders
+with no parseable ZIP/state are skipped rather than declined on a guess. Accept and
+decline share the exactly-once lock key, so two detectors never both act on the
+same `(account, order)`.
+
 ### Accept: race A and B, verify with a third read
 The executor fires both paths concurrently and takes whichever confirms first,
 then re-reads order status (source of truth) to report a truthful outcome. The
 verify is awaited but is *outcome reporting*, not part of winning the race.
+Decline works identically, and the race primitive is shared (`accept/race.js`).
 
 Hot-path latency optimizations (in `HttpClient` + `PortalSession`):
 - **Warm keep-alive connections** — the accept reuses an open TLS socket, no

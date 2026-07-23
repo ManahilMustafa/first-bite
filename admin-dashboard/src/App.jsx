@@ -5,6 +5,8 @@ import { Accounts } from './pages/Accounts'
 import { AddAccount } from './pages/AddAccount'
 import { Dashboard } from './pages/Dashboard'
 import { Login } from './pages/Login'
+import { Orders } from './pages/Orders'
+import { Stats } from './pages/Stats'
 
 function ProtectedRoute({ children }) {
   const { isAuthenticated } = useAuth()
@@ -24,6 +26,8 @@ export default function App() {
         }
       >
         <Route index element={<Dashboard />} />
+        <Route path="orders" element={<Orders />} />
+        <Route path="stats" element={<Stats />} />
         <Route path="accounts" element={<Accounts />} />
         <Route path="add-account" element={<AddAccount />} />
       </Route>

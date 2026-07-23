@@ -1,43 +1,55 @@
-// Wire a Gmail refresh token to an account: profile lookup + Pub/Sub watch registration.
+// Wire a Gmail refresh token: profile lookup + Pub/Sub watch registration.
 
 import { logger } from '../util/logger.js';
 
 const log = logger('gmail-connect');
 
 /**
- * After OAuth (or manual token paste), persist gmailAddress + historyId and
- * register the users.watch() push subscription.
+ * Connect the ONE central inbox that all users forward into. Persists the
+ * refresh token + central email + historyId to the GmailConnectionStore and
+ * registers the users.watch() push subscription.
  */
-export async function connectGmailAccount({ store, gmailWatcher, accountId, refreshToken, topicName }) {
+export async function connectCentralGmail({ connectionStore, gmailWatcher, refreshToken, topicName }) {
   if (!gmailWatcher?.oauth?.clientId) throw new Error('Gmail OAuth not configured');
-  if (!topicName) throw new Error('GMAIL_PUBSUB_TOPIC not configured');
-
-  const account = await store.get(accountId);
-  if (!account) throw new Error(`account not found: ${accountId}`);
 
   const accessToken = await gmailWatcher.accessTokenFor(refreshToken);
   const profile = await gmailWatcher.getProfile(accessToken);
-  const watch = await gmailWatcher.registerWatch(accessToken, topicName);
 
-  await store.upsert({
-    ...account,
-    gmailRefreshToken: refreshToken,
-    gmailAddress: profile.emailAddress,
-    historyId: String(watch.historyId),
+  // Register the Pub/Sub watch if a topic is configured, but DON'T fail the whole
+  // connection if it can't (topic missing/misconfigured). Without a watch there
+  // are no push notifications — detection then relies on the per-user portal
+  // pollers and the manual dry-run — but the token is stored so attribution /
+  // region / decline can be exercised immediately.
+  let watch = null;
+  const pushConfigured = !!topicName && !/your-project/i.test(topicName);
+  if (pushConfigured) {
+    try {
+      watch = await gmailWatcher.registerWatch(accessToken, topicName);
+    } catch (e) {
+      log.warn('gmail watch registration failed — connected WITHOUT push', { err: String(e) });
+    }
+  } else {
+    log.info('GMAIL_PUBSUB_TOPIC not configured — connected; detection via poll loop only');
+  }
+
+  // Seed the cursor from the watch if we got one, else from the mailbox profile.
+  const historyId = String(watch?.historyId || profile.historyId);
+  await connectionStore.save({
+    emailAddress: profile.emailAddress,
+    refreshToken,
+    historyId,
+    watchExpiration: watch?.expiration ? Number(watch.expiration) : undefined,
+    updatedAt: new Date().toISOString(),
   });
 
-  log.info('gmail connected', {
-    accountId,
-    email: profile.emailAddress,
-    historyId: watch.historyId,
-    watchExpires: watch.expiration,
-  });
+  log.info('central gmail connected', { email: profile.emailAddress, historyId, push: !!watch });
 
   return {
     emailAddress: profile.emailAddress,
-    historyId: String(watch.historyId),
-    watchExpiration: watch.expiration,
+    historyId,
+    watchExpiration: watch?.expiration,
+    push: !!watch,
   };
 }
 
-export default connectGmailAccount;
+export default connectCentralGmail;
