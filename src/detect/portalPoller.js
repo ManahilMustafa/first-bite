@@ -48,6 +48,12 @@ export class PortalPoller {
     const tick = async () => {
       if (this._running || this._stopped) return;
       this._running = true;
+      // The order can't have been visible any earlier than the START of the
+      // PREVIOUS tick (that's the last time we checked and it wasn't there) —
+      // the only honest detection-latency bound we have for a portal-only
+      // order (there's no origination timestamp to anchor to, unlike email).
+      const previousPollAt = this._lastPollAt;
+      this._lastPollAt = Date.now();
       const t0 = process.hrtime.bigint();
       try {
         const page = await this.session.authedGet(this.newOrdersPath);
@@ -66,6 +72,7 @@ export class PortalPoller {
                 address,
                 zip: meta.zip,
                 state: meta.state,
+                previousPollAt,
               });
             } catch (e) {
               this.log.error('onOrder handler threw', { err: String(e) });

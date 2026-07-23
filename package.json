@@ -1,7 +1,7 @@
 {
-  "name": "estreet-bot",
+  "name": "firstbite",
   "version": "1.0.0",
-  "description": "Multi-account auto-accept bot for E-Street / ValueLink AMS appraisal orders",
+  "description": "FirstBite — multi-account auto-accept bot for E-Street / ValueLink AMS appraisal orders",
   "type": "module",
   "main": "src/index.js",
   "engines": {
@@ -11,7 +11,8 @@
     "start": "node src/index.js",
     "control-plane": "node src/controlPlane/server.js",
     "test": "node --test \"test/*.test.js\"",
-    "test:watch": "node --test --watch \"test/*.test.js\""
+    "test:watch": "node --test --watch \"test/*.test.js\"",
+    "latency-report": "node scripts/latency-report.mjs"
   },
   "keywords": [
     "estreet",

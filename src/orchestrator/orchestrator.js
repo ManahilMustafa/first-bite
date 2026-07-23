@@ -12,6 +12,16 @@
 import { AccountWorker } from '../worker/worker.js';
 import { logger } from '../util/logger.js';
 
+// How long to wait before retrying a start() that just failed. Every
+// account CRUD op (add/activate/remove — even for a *different* account)
+// calls sync(), which retries every active account not yet in `workers`.
+// Without a cooldown, an account whose start() fails because the portal
+// wants a fresh OTP gets a brand-new OTP dispatched on every one of those
+// unrelated calls — the human on the other end sees a new code land every
+// time anyone touches the accounts list. The cooldown makes retries track
+// "meaningful time has passed", not "someone edited an unrelated account".
+const DEFAULT_START_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+
 export class Orchestrator {
   /**
    * @param {object} opts
@@ -19,13 +29,16 @@ export class Orchestrator {
    * @param {object} opts.lock                shared lock for the whole fleet
    * @param {(account:object, ctx:object)=>AccountWorker} [opts.workerFactory]
    * @param {(event:object)=>void} [opts.onResult]
+   * @param {number} [opts.startRetryCooldownMs] min time between start() retries for the same account after a failure
    */
-  constructor({ store, lock, workerFactory, onResult, log = logger }) {
+  constructor({ store, lock, workerFactory, onResult, startRetryCooldownMs = DEFAULT_START_RETRY_COOLDOWN_MS, log = logger }) {
     this.store = store;
     this.lock = lock;
     this.onResult = onResult;
     this.log = log('orchestrator');
     this.workers = new Map(); // accountId -> AccountWorker
+    this.startRetryCooldownMs = startRetryCooldownMs;
+    this._failedStartAt = new Map(); // accountId -> timestamp of last failed start()
     this.workerFactory =
       workerFactory ||
       ((account) =>
@@ -41,19 +54,32 @@ export class Orchestrator {
       const active = await this.store.listActive();
       const activeIds = new Set(active.map((a) => a.id));
 
-      // Stop workers whose account is gone or deactivated.
-      for (const [id, worker] of this.workers) {
-        if (!activeIds.has(id)) {
-          await this._stopWorker(id, worker);
-        }
-      }
+      // Stop workers whose account is gone or deactivated. Independent accounts
+      // — run concurrently rather than one-at-a-time.
+      const toStop = [...this.workers].filter(([id]) => !activeIds.has(id));
+      await Promise.all(toStop.map(([id, worker]) => this._stopWorker(id, worker)));
 
-      // Start workers for newly-active accounts.
-      for (const account of active) {
-        if (!this.workers.has(account.id)) {
-          await this._startWorker(account);
+      // Start workers for newly-active accounts — likewise concurrently. Each
+      // worker's start() does its own login (and, for accounts that require a
+      // fresh-login OTP, can take many seconds); awaiting them one at a time
+      // meant account N had to wait for accounts 1..N-1 to fully finish logging
+      // in before it even BEGAN — an N-account fleet paid N× a single login's
+      // worth of avoidable downtime on every boot/reconfigure. Nothing about
+      // starting one account's worker depends on another's.
+      const now = Date.now();
+      const toStart = active.filter((account) => {
+        if (this.workers.has(account.id)) return false;
+        const failedAt = this._failedStartAt.get(account.id);
+        if (failedAt && now - failedAt < this.startRetryCooldownMs) {
+          this.log.info('worker start on cooldown, skipping retry', {
+            id: account.id,
+            retryInMs: this.startRetryCooldownMs - (now - failedAt),
+          });
+          return false;
         }
-      }
+        return true;
+      });
+      await Promise.all(toStart.map((account) => this._startWorker(account)));
 
       this.log.info('sync complete', { live: this.workers.size, active: active.length });
       return { live: this.workers.size };
@@ -67,8 +93,10 @@ export class Orchestrator {
     try {
       await worker.start();
       this.workers.set(account.id, worker);
+      this._failedStartAt.delete(account.id);
       this.log.info('worker up', { id: account.id, label: account.label });
     } catch (e) {
+      this._failedStartAt.set(account.id, Date.now());
       this.log.error('worker failed to start', { id: account.id, err: String(e) });
       try {
         await worker.stop();
@@ -98,9 +126,14 @@ export class Orchestrator {
     return worker.handleOrder(order);
   }
 
-  getWorkerByGmail(gmailAddress) {
+  getWorker(accountId) {
+    return this.workers.get(accountId) || null;
+  }
+
+  getWorkerByForwardingEmail(forwardingEmail) {
+    const needle = String(forwardingEmail || '').toLowerCase();
     for (const w of this.workers.values()) {
-      if (w.account.gmailAddress === gmailAddress) return w;
+      if ((w.account.forwardingEmail || '').toLowerCase() === needle) return w;
     }
     return null;
   }

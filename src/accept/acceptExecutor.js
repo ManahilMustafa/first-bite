@@ -11,6 +11,7 @@
 // already won the lock for `orderId`.
 import { acceptViaEmailLink } from './emailAccept.js';
 import { acceptViaPortal } from './portalAccept.js';
+import { tagResult, firstSuccessOrAll } from './race.js';
 import { logger } from '../util/logger.js';
 
 /**
@@ -37,12 +38,15 @@ export async function executeAccept({
 
   if (acceptUrl) {
     tasks.push(
-      tag('email', acceptViaEmailLink({ acceptUrl, http: session?.http }))
+      tagResult(
+        'email',
+        acceptViaEmailLink({ acceptUrl, http: session?.http, session, log: log.child('email') })
+      )
     );
   }
   if (session) {
     tasks.push(
-      tag('portal', acceptViaPortal({ session, orderId, ...portalOpts }))
+      tagResult('portal', acceptViaPortal({ session, orderId, log: log.child('portal'), ...portalOpts }))
     );
   }
 
@@ -74,60 +78,74 @@ export async function executeAccept({
     outcome = taken ? 'taken' : (Object.values(paths).find((p) => p?.outcome)?.outcome || 'failed');
   }
 
-  // Verify against source of truth (the portal status), if a verifier is given.
+  // Verify against source of truth (the portal), if a verifier is given.
+  // Timed separately from the race (durationMs above) so a latency report can
+  // tell "how long did winning take" apart from "how long did confirming it
+  // take" — conflating the two would hide which one is actually the bottleneck.
+  //
+  // CRITICAL: verify must NEVER invent an accept. If every path failed before
+  // clicking anything (not_found / needs_login), a flaky status-page regex used
+  // to flip those into accepted:true / via:'verified' — the dashboard lied while
+  // the portal never got an Accept click. Verify may confirm a real path win,
+  // detect 'taken', or confirm an ambiguous post that actually landed — but not
+  // promote a pure miss into a success.
   let verified = null;
+  let verifyDurationMs = 0;
   if (verify) {
+    const verifyStartedAt = process.hrtime.bigint();
     try {
       verified = await verify(orderId);
-      if (verified === 'accepted') {
-        accepted = true;
-        outcome = 'accepted';
-        via = via || 'verified';
-      } else if (verified === 'taken') {
+      log.info('final portal confirmation', { orderId, verified });
+      const neverActed = Object.values(paths).every(
+        (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)
+      );
+      if (verified === 'taken') {
         accepted = false;
         outcome = 'taken';
+      } else if (verified === 'accepted') {
+        if (accepted || !neverActed) {
+          accepted = true;
+          outcome = 'accepted';
+          via = via || 'verified';
+        } else {
+          log.warn('verify said accepted but no accept path acted — not claiming a win', {
+            orderId,
+            paths,
+          });
+        }
       }
     } catch (e) {
       log.warn('verify failed', { orderId, err: String(e) });
+    } finally {
+      verifyDurationMs = Number(process.hrtime.bigint() - verifyStartedAt) / 1e6;
     }
   }
 
-  log.info('accept result', { orderId, accepted, via, outcome, ms: Math.round(durationMs), verified });
-  return { accepted, via, outcome, durationMs, paths, verified };
-}
-
-/** Attach a name to a promise result. */
-function tag(name, promise) {
-  return promise.then(
-    (r) => ({ ...r, __name: name }),
-    (err) => ({ ok: false, outcome: 'error', __name: name, error: String(err) })
-  );
-}
-
-/**
- * Resolve with the first result for which `isWin(name,result)` is true; if none
- * win, resolve with the all-settled "best" result (first non-error, else first).
- */
-async function firstSuccessOrAll(tasks, onSettle) {
-  return new Promise((resolve) => {
-    let remaining = tasks.length;
-    const all = [];
-    let resolved = false;
-    for (const t of tasks) {
-      t.then((result) => {
-        all.push(result);
-        const win = onSettle(result.__name, result);
-        if (win && !resolved) {
-          resolved = true;
-          resolve(result);
-        }
-        if (--remaining === 0 && !resolved) {
-          resolved = true;
-          resolve(all.find((r) => r && r.outcome !== 'error') || all[0] || null);
-        }
-      });
-    }
-  });
+  if (accepted) {
+    log.info('accept result', {
+      orderId,
+      accepted,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+    });
+  } else {
+    // Never let a failure disappear into a one-line summary: dump every path's
+    // exact status/response so the real cause is debuggable without re-running.
+    log.error('accept result: FAILED', {
+      orderId,
+      accepted,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+      paths,
+    });
+  }
+  return { accepted, via, outcome, durationMs, verifyDurationMs, paths, verified };
 }
 
 export default executeAccept;

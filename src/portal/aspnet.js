@@ -54,8 +54,11 @@ export function buildPostback(html, eventTarget, eventArgument = '', extra = {})
 /**
  * Find the __doPostBack event target for a control, by matching nearby text.
  * Returns the control name to put in __EVENTTARGET, or null.
- * Handles both link buttons (href="javascript:__doPostBack('target','arg')")
- * and submit buttons (<input type=submit name="target" value="Accept">).
+ * Handles:
+ *   - link buttons (href="javascript:__doPostBack('target','arg')")
+ *   - submit buttons (<input type=submit name="target" value="Accept">)
+ *   - image buttons (<input type=image name="…imgBtnBroadcastAccept" title="…accept…">)
+ *     — the real E-Street New Orders Accept/Decline controls are type=image ticks.
  */
 export function findPostbackTarget(html, labelRe) {
   // 1) Anchor/link buttons with __doPostBack in href or onclick.
@@ -68,15 +71,25 @@ export function findPostbackTarget(html, labelRe) {
     const pb = onclickOrHref.match(/__doPostBack\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]/i);
     if (pb && labelRe.test(text)) return { target: pb[1], argument: pb[2] };
   }
-  // 2) Submit/button inputs whose value matches the label.
+  // 2) Submit/button/image inputs.
   const inputRe = /<input\b[^>]*>/gi;
   while ((m = inputRe.exec(html))) {
     const tag = m[0];
     const type = (attr(tag, 'type') || '').toLowerCase();
-    if (type !== 'submit' && type !== 'button') continue;
-    const value = attr(tag, 'value') || '';
     const name = attr(tag, 'name');
-    if (name && labelRe.test(value)) return { target: name, argument: '', isSubmit: true, submitValue: value };
+    if (!name) continue;
+    if (type === 'submit' || type === 'button') {
+      const value = attr(tag, 'value') || '';
+      if (labelRe.test(value)) return { target: name, argument: '', isSubmit: true, submitValue: value };
+      continue;
+    }
+    // ASP.NET ImageButton → <input type="image">. A click posts name.x / name.y
+    // (not __EVENTTARGET). Match name/id/title/alt so "Accept" finds
+    // imgBtnBroadcastAccept ("Click here to accept this order").
+    if (type === 'image') {
+      const hay = [name, attr(tag, 'id') || '', attr(tag, 'title') || '', attr(tag, 'alt') || ''].join(' ');
+      if (labelRe.test(hay)) return { target: name, argument: '', isImage: true };
+    }
   }
   // 3) <button> elements.
   const btnRe = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
@@ -87,6 +100,25 @@ export function findPostbackTarget(html, labelRe) {
     if (name && labelRe.test(text)) return { target: name, argument: '', isSubmit: true, submitValue: text };
   }
   return null;
+}
+
+/**
+ * Build the form body that simulates clicking a control returned by
+ * findPostbackTarget (link / submit / image).
+ */
+export function buildControlClick(html, pb) {
+  const extra = { ...(pb.extra || {}) };
+  if (pb.isSubmit && pb.submitValue) extra[pb.target] = pb.submitValue;
+  // Image buttons are identified by the presence of name.x / name.y in the POST
+  // (browser click coordinates). ASP.NET does not need __EVENTTARGET for them.
+  if (pb.isImage) {
+    extra[`${pb.target}.x`] = '1';
+    extra[`${pb.target}.y`] = '1';
+  }
+  const useEventTarget = !pb.isSubmit && !pb.isImage;
+  const body = buildPostback(html, useEventTarget ? pb.target : '', pb.argument || '', extra);
+  if (useEventTarget) body.__EVENTTARGET = pb.target;
+  return body;
 }
 
 /** Resolve the first <form action="..."> against a base URL. */
@@ -109,6 +141,28 @@ export function looksLikeLogin(html) {
   const hasPassword = /<input[^>]*type\s*=\s*['"]?password/i.test(html);
   const mentionsLogin = /log\s*in|sign\s*in|forgot your password|user\s*name/i.test(h);
   return hasPassword && mentionsLogin;
+}
+
+/** Heuristic: does this HTML look like a post-login email-OTP challenge page? */
+export function looksLikeOtpPage(html) {
+  if (!html) return false;
+  const h = html.toLowerCase();
+  const mentionsCode = /verification code|enter.{0,20}\bcode\b|6.?digit code/i.test(h);
+  const hasCodeInput = /<input[^>]*maxlength\s*=\s*['"]?6['"]?[^>]*>/i.test(html);
+  return mentionsCode && hasCodeInput;
+}
+
+// Common ASP.NET WebForms phrasing for a rejected/stale postback — distinct
+// from a login bounce (looksLikeLogin): the session IS authenticated, but the
+// __VIEWSTATE/__EVENTVALIDATION we posted no longer matches what the server
+// expects. Used only by the opt-in cached-page reuse path (see portalAccept.js
+// / portalDecline.js) to detect "the cached page's tokens were stale — redo
+// this with a guaranteed-fresh GET" without mistaking it for a real failure.
+export function looksLikeStaleState(html) {
+  if (!html) return false;
+  return /session (has )?expired|invalid\s+viewstate|viewstate is invalid|unable to validate data|validateantiforgerytoken/i.test(
+    html
+  );
 }
 
 // ── tiny attribute reader ────────────────────────────────────────────────────

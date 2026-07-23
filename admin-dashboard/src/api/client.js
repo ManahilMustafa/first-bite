@@ -12,9 +12,14 @@ export function setToken(token) {
   else localStorage.removeItem(TOKEN_KEY)
 }
 
+// Every endpoint here is backed by local persisted data (JSONL/encrypted-JSON
+// files) — none of them call Gmail or the portal — so a real response is always
+// fast. 8s is generous headroom for a slow machine, not a real operation time;
+// if a request ever takes that long something is genuinely broken and should
+// fail fast rather than leave the UI hanging.
 const client = axios.create({
   baseURL: API_BASE,
-  timeout: 15000,
+  timeout: 8000,
 })
 
 client.interceptors.request.use((config) => {
@@ -48,8 +53,37 @@ export async function deleteAccount(id) {
   return data
 }
 
-export async function getGmailAuthUrl(accountId) {
-  const { data } = await client.get(`/api/accounts/${accountId}/gmail/auth-url`)
+// Central inbox: ONE Gmail connection for the whole system (all users forward here).
+export async function getGmailAuthUrl() {
+  const { data } = await client.get('/api/gmail/auth-url')
+  return data
+}
+
+export async function getGmailStatus() {
+  const { data } = await client.get('/api/gmail/status')
+  return data
+}
+
+export async function getOrders(params = {}) {
+  const { data } = await client.get('/api/orders', { params })
+  return data
+}
+
+// Live Orders view: one record per order (repeated attempts collapsed), with a
+// single final status + a full technical timeline. Pure local-data aggregation
+// server-side — always fast, never waits on Gmail/portal operations.
+export async function getLiveOrders(params = {}) {
+  const { data } = await client.get('/api/orders/live', { params })
+  return data
+}
+
+export async function getStats() {
+  const { data } = await client.get('/api/stats')
+  return data
+}
+
+export async function scanInbox() {
+  const { data } = await client.post('/api/orders/scan')
   return data
 }
 

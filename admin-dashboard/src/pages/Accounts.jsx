@@ -1,5 +1,6 @@
-import { useState } from 'react'
-import { deleteAccount, getGmailAuthUrl, setAccountActive } from '../api/client'
+import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
+import { deleteAccount, getGmailAuthUrl, getGmailStatus, setAccountActive } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import { useAccounts } from '../hooks/useAccounts'
 import { formatRegion, isWorkerLive, maskEmail } from '../utils/format'
@@ -8,17 +9,37 @@ export function Accounts() {
   const { accounts, live, loading, error, lastUpdated, refresh } = useAccounts()
   const [actionId, setActionId] = useState(null)
   const [actionError, setActionError] = useState(null)
+  const [gmail, setGmail] = useState(null)
+  const [connecting, setConnecting] = useState(false)
 
-  async function handleConnectGmail(account) {
-    setActionId(account.id)
+  useEffect(() => {
+    let cancelled = false
+    async function loadStatus() {
+      try {
+        const s = await getGmailStatus()
+        if (!cancelled) setGmail(s)
+      } catch {
+        /* status is best-effort */
+      }
+    }
+    loadStatus()
+    const id = setInterval(loadStatus, 10000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [])
+
+  async function handleConnectCentralInbox() {
+    setConnecting(true)
     setActionError(null)
     try {
-      const { url } = await getGmailAuthUrl(account.id)
+      const { url } = await getGmailAuthUrl()
       window.open(url, '_blank', 'noopener,noreferrer')
     } catch (err) {
       setActionError(err.response?.data?.error || err.message)
     } finally {
-      setActionId(null)
+      setConnecting(false)
     }
   }
 
@@ -66,17 +87,43 @@ export function Accounts() {
         <div className="alert alert-error">{error || actionError}</div>
       )}
 
+      {/* ONE central inbox for the whole system — all users forward their orders here. */}
+      <section className="panel">
+        <div className="panel-header panel-header-split">
+          <h3>Central Inbox (Gmail)</h3>
+          {gmail?.connected ? (
+            <StatusBadge variant="success">{gmail.emailAddress || 'Connected'}</StatusBadge>
+          ) : (
+            <StatusBadge variant="neutral">Not connected</StatusBadge>
+          )}
+        </div>
+        <div className="quick-actions accounts-gmail-actions">
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={connecting}
+            onClick={handleConnectCentralInbox}
+          >
+            {connecting ? 'Opening…' : gmail?.connected ? 'Reconnect inbox' : 'Connect central inbox'}
+          </button>
+          <span className="field-hint">
+            Every user forwards their E-Street order emails into this one inbox. Orders are
+            attributed to a user by their Forwarding Email below.
+          </span>
+        </div>
+      </section>
+
       <section className="panel panel-flush">
-        <div className="table-wrap">
-          <table className="data-table">
+        <div className="table-wrap accounts-table-wrap">
+          <table className="data-table accounts-table">
             <thead>
               <tr>
                 <th>Label</th>
-                <th>Email</th>
+                <th>Portal Email</th>
+                <th>Forwarding</th>
                 <th>Region</th>
                 <th>Status</th>
                 <th>Worker</th>
-                <th>Gmail</th>
                 <th>Poll (ms)</th>
                 <th>Actions</th>
               </tr>
@@ -100,40 +147,41 @@ export function Accounts() {
                   const busy = actionId === account.id
                   return (
                     <tr key={account.id}>
-                      <td>
+                      <td data-label="Label">
                         <strong>{account.label || '—'}</strong>
                       </td>
-                      <td>{maskEmail(account.portalUsername)}</td>
-                      <td className="region-cell">{formatRegion(account)}</td>
-                      <td>
+                      <td data-label="Portal Email" className="accounts-email-cell">
+                        {maskEmail(account.portalUsername)}
+                      </td>
+                      <td data-label="Forwarding" className="accounts-email-cell">
+                        {account.forwardingEmail ? (
+                          maskEmail(account.forwardingEmail)
+                        ) : (
+                          <span className="muted">not set</span>
+                        )}
+                      </td>
+                      <td data-label="Region" className="region-cell">
+                        {formatRegion(account)}
+                      </td>
+                      <td data-label="Status" className="accounts-badge-cell">
                         <StatusBadge variant={account.active ? 'success' : 'neutral'}>
                           {account.active ? 'Active' : 'Inactive'}
                         </StatusBadge>
                       </td>
-                      <td>
+                      <td data-label="Worker" className="accounts-badge-cell">
                         <StatusBadge variant={workerLive ? 'live' : 'stopped'}>
                           {workerLive ? 'Live' : 'Stopped'}
                         </StatusBadge>
                       </td>
-                      <td>
-                        {account.gmailRefreshToken ? (
-                          <StatusBadge variant="success">
-                            {account.gmailAddress || 'Connected'}
-                          </StatusBadge>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn btn-sm btn-secondary"
-                            disabled={busy}
-                            onClick={() => handleConnectGmail(account)}
-                          >
-                            Connect Gmail
-                          </button>
-                        )}
-                      </td>
-                      <td>{account.pollIntervalMs ?? '—'}</td>
-                      <td>
+                      <td data-label="Poll (ms)">{account.pollIntervalMs ?? '—'}</td>
+                      <td data-label="Actions">
                         <div className="row-actions">
+                          <Link
+                            to={`/add-account?id=${encodeURIComponent(account.id)}`}
+                            className="btn btn-sm btn-secondary"
+                          >
+                            Edit
+                          </Link>
                           <button
                             type="button"
                             className={`btn btn-sm ${account.active ? 'btn-secondary' : 'btn-primary'}`}

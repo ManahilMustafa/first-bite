@@ -2,11 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MemoryLock } from '../src/lock/memoryLock.js';
 import { encrypt, decrypt, encryptFields, decryptFields, resolveKey } from '../src/util/crypto.js';
+import { CookieJar } from '../src/util/httpClient.js';
 import {
   scrapeHiddenFields,
   buildPostback,
+  buildControlClick,
   findPostbackTarget,
   looksLikeLogin,
+  looksLikeStaleState,
 } from '../src/portal/aspnet.js';
 
 const KEY = resolveKey(Buffer.alloc(32, 7).toString('base64'));
@@ -33,6 +36,25 @@ test('encryptFields/decryptFields handle selected fields', () => {
   const dec = decryptFields(enc, ['portalPassword', 'gmailRefreshToken'], KEY);
   assert.equal(dec.portalPassword, 'p');
   assert.equal(dec.gmailRefreshToken, 't');
+});
+
+// ── cookie jar ──────────────────────────────────────────────────────────────--
+test('CookieJar export/import round-trips cookies across a fresh jar', () => {
+  const jar = new CookieJar();
+  jar.setFromHeaders('portal.example.com', ['ASP.NET_SessionId=abc123; path=/; HttpOnly', 'lang=en; path=/']);
+  const snapshot = jar.export();
+
+  const restored = new CookieJar();
+  restored.import(snapshot);
+  assert.equal(restored.header('portal.example.com'), jar.header('portal.example.com'));
+});
+
+test('CookieJar import merges into (not replaces) an existing jar\'s other hosts', () => {
+  const jar = new CookieJar();
+  jar.setFromHeaders('other.example.com', ['x=1; path=/']);
+  jar.import({ 'portal.example.com': { 'ASP.NET_SessionId': 'abc123' } });
+  assert.equal(jar.header('other.example.com'), 'x=1');
+  assert.equal(jar.header('portal.example.com'), 'ASP.NET_SessionId=abc123');
 });
 
 // ── lock ──────────────────────────────────────────────────────────────────────
@@ -80,6 +102,35 @@ test('finds the accept __doPostBack target', () => {
   assert.equal(pb.argument, '266-03335');
 });
 
+test('finds ASP.NET type=image Accept tick (real E-Street BroadcastAccept)', () => {
+  const html = `<form>
+    <td>267-25786</td>
+    <input type="image" name="ctl00$cphBody$grdNewOrders$ctl02$imgBtnBroadcastAccept"
+           title="Click here to accept this order" src="../images/appraiser-tick.png" />
+    <input type="image" name="ctl00$cphBody$grdNewOrders$ctl02$imgBtnDecline"
+           title="Click here to decline this order" src="../images/appraiser-block.png" />
+  </form>`;
+  const accept = findPostbackTarget(html, /accept/i);
+  assert.equal(accept.isImage, true);
+  assert.match(accept.target, /imgBtnBroadcastAccept/);
+  const decline = findPostbackTarget(html, /decline/i);
+  assert.equal(decline.isImage, true);
+  assert.match(decline.target, /imgBtnDecline/);
+});
+
+test('buildControlClick posts name.x/name.y for image buttons', () => {
+  const html = `<form>
+    <input type="hidden" name="__VIEWSTATE" value="VS1" />
+    <input type="hidden" name="__EVENTVALIDATION" value="EV1" />
+    <input type="image" name="ctl00$cphBody$imgBtnBroadcastAccept" title="accept" />
+  </form>`;
+  const pb = findPostbackTarget(html, /accept/i);
+  const body = buildControlClick(html, pb);
+  assert.equal(body['ctl00$cphBody$imgBtnBroadcastAccept.x'], '1');
+  assert.equal(body['ctl00$cphBody$imgBtnBroadcastAccept.y'], '1');
+  assert.equal(body.__EVENTTARGET, '');
+});
+
 test('buildPostback assembles state + event fields', () => {
   const body = buildPostback(PAGE, 'ctl00$gv$btnAccept', '266-03335');
   assert.equal(body.__EVENTTARGET, 'ctl00$gv$btnAccept');
@@ -91,4 +142,12 @@ test('looksLikeLogin detects a login page', () => {
   const login = `<form><input type="password" name="pw"/><span>Sign in</span></form>`;
   assert.equal(looksLikeLogin(login), true);
   assert.equal(looksLikeLogin('<div>New Orders</div>'), false);
+});
+
+test('looksLikeStaleState detects a rejected/stale postback distinct from a login bounce', () => {
+  assert.equal(looksLikeStaleState('<div>Your session has expired. Please refresh.</div>'), true);
+  assert.equal(looksLikeStaleState('<div>The __VIEWSTATE is invalid.</div>'), true);
+  assert.equal(looksLikeStaleState('<div>Order accepted. Thank you.</div>'), false);
+  // A login bounce is a DIFFERENT signal — not a stale-state rejection.
+  assert.equal(looksLikeStaleState('<form><input type="password"/>Sign in</form>'), false);
 });

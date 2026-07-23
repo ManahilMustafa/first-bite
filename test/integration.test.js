@@ -68,7 +68,43 @@ test('end-to-end: poller detects a new order and the worker accepts it', async (
   }
 });
 
-test('region filter skips orders outside allowed ZIP prefixes', async () => {
+test('reported events carry the full latency-report instrumentation (detection/lock/verify/total)', async () => {
+  const lock = new MemoryLock();
+  const events = [];
+  const worker = makeWorker({ username: 'vendor1', password: 'pass1' }, lock, {
+    onResult: (e) => events.push(e),
+  });
+  try {
+    await worker.start();
+    // Let at least one real poll tick run first so the poller has a genuine
+    // previousPollAt to anchor detectionLatencyMs to (the very first tick right
+    // after start() legitimately has none yet — "no anchor, no number" is
+    // correct there, not a bug — so we sidestep that edge case here).
+    await new Promise((r) => setTimeout(r, 80));
+    portal.addOrder('266-09000', { address: '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613' });
+
+    const ok = await waitFor(() => events.length >= 1, 5000);
+    assert.equal(ok, true);
+
+    const e = events[0];
+    assert.equal(typeof e.detectedAt, 'number');
+    // Portal-sourced: detectionLatencyMs is an upper bound anchored to the
+    // previous poll tick (pollIntervalMs:40 here), never negative, never huge.
+    assert.equal(typeof e.detectionLatencyMs, 'number');
+    assert.ok(e.detectionLatencyMs >= 0 && e.detectionLatencyMs < 2000, `detectionLatencyMs=${e.detectionLatencyMs}`);
+    assert.equal(typeof e.lockWaitMs, 'number');
+    assert.ok(e.lockWaitMs >= 0 && e.lockWaitMs < 100, `lockWaitMs=${e.lockWaitMs}`);
+    assert.equal(typeof e.verifyDurationMs, 'number');
+    assert.ok(e.verifyDurationMs >= 0);
+    assert.equal(typeof e.totalMs, 'number');
+    // total must be at least as long as the race itself.
+    assert.ok(e.totalMs >= e.durationMs, `totalMs=${e.totalMs} durationMs=${e.durationMs}`);
+  } finally {
+    await worker.stop();
+  }
+});
+
+test('region filter DECLINES out-of-region orders and ACCEPTS in-region ones', async () => {
   const lock = new MemoryLock();
   const worker = new AccountWorker({
     account: {
@@ -79,22 +115,32 @@ test('region filter skips orders outside allowed ZIP prefixes', async () => {
       portalPassword: 'pass1',
       pollIntervalMs: 40,
       regionZipPrefixes: ['32'],
-      regionStates: ['FL'],
     },
     lock,
     poll: false,
   });
   try {
     await worker.start();
-    const skipped = await worker.handleOrder({
-      orderId: '266-03335',
+
+    // Out-of-region: FL 34613 (prefix 34) is not in ['32'] → actively declined.
+    const oor = portal.addOrder('266-03335', {
+      address: '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613',
+      emailOwner: 'vendor1',
+    });
+    const declined = await worker.handleOrder({
+      orderId: oor,
       source: 'gmail',
+      acceptUrl: portal.emailAcceptUrl(oor),
+      declineUrl: portal.emailDeclineUrl(oor),
       address: '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613',
     });
-    assert.equal(skipped.skipped, true);
-    assert.equal(skipped.reason, 'zip_mismatch');
-    assert.equal(worker.stats.regionSkipped, 1);
+    assert.equal(declined.action, 'decline');
+    assert.equal(declined.declined, true);
+    assert.equal(declined.reason, 'zip_mismatch');
+    assert.equal(worker.stats.declined, 1);
+    assert.equal(portal.orderStatus(oor), 'declined');
 
+    // In-region: Jacksonville FL 32207 (prefix 32) → accepted.
     portal.addOrder('900-00002', { address: '100 MAIN ST JACKSONVILLE FL 32207' });
     const accepted = await worker.handleOrder({
       orderId: '900-00002',

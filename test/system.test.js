@@ -11,6 +11,17 @@ import { createControlPlane } from '../src/controlPlane/server.js';
 
 const KEY = Buffer.alloc(32, 3).toString('base64');
 
+// Polls a condition until true — used where a background orchestrator.sync()
+// needs to catch up with an HTTP response that no longer awaits it.
+async function waitFor(predicate, message, { timeoutMs = 2000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  assert.fail(`timed out waiting for: ${message}`);
+}
+
 let storePath;
 beforeEach(() => {
   storePath = join(tmpdir(), `accts-${randomUUID()}.json`);
@@ -56,12 +67,98 @@ test('store setActive/listActive/remove behave', async () => {
   assert.equal((await store.list()).length, 0);
 });
 
-test('store advances Gmail historyId by address', async () => {
+test('activatedAt is stamped once on first activation and never overwritten', async () => {
   const store = newStore();
-  await store.upsert({ label: 'a', portalBaseUrl: 'x', portalUsername: 'u', portalPassword: 'p', gmailAddress: 'g@x.com' });
-  assert.equal(await store.saveHistoryId('g@x.com', '777'), true);
-  const acct = (await store.list()).find((a) => a.gmailAddress === 'g@x.com');
-  assert.equal(acct.historyId, '777');
+  const before = Date.now();
+  const id = await store.upsert({ label: 'a', portalBaseUrl: 'x', portalUsername: 'u', portalPassword: 'p' });
+  const acct = await store.get(id);
+  assert.ok(acct.activatedAt >= before, 'new active-by-default account is stamped immediately');
+
+  const firstStamp = acct.activatedAt;
+  await store.setActive(id, false);
+  await store.setActive(id, true); // reactivating must NOT move the cutover forward
+  const after = await store.get(id);
+  assert.equal(after.activatedAt, firstStamp);
+});
+
+test('activatedAt is only set once the account actually goes active', async () => {
+  const store = newStore();
+  const id = await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'x',
+    portalUsername: 'u',
+    portalPassword: 'p',
+    active: false,
+  });
+  assert.equal((await store.get(id)).activatedAt, undefined);
+  await store.setActive(id, true);
+  assert.ok((await store.get(id)).activatedAt);
+});
+
+test('findByForwardingEmail returns only the ACTIVE matching account (case-insensitive)', async () => {
+  const store = newStore();
+  const id = await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'x',
+    portalUsername: 'u',
+    portalPassword: 'p',
+    forwardingEmail: 'Vendor@Gmail.com',
+  });
+  // Stored lowercased; matched case-insensitively.
+  assert.equal((await store.findByForwardingEmail('vendor@gmail.com'))?.id, id);
+  assert.equal((await store.findByForwardingEmail('VENDOR@GMAIL.COM'))?.id, id);
+
+  // Deactivated → no longer attributable.
+  await store.setActive(id, false);
+  assert.equal(await store.findByForwardingEmail('vendor@gmail.com'), null);
+});
+
+test('upsert allows multiple accounts to share a forwardingEmail (one operator, several vendor logins)', async () => {
+  const store = newStore();
+  const idA = await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'x',
+    portalUsername: 'u1',
+    portalPassword: 'p',
+    forwardingEmail: 'shared@gmail.com',
+  });
+  const idB = await store.upsert({
+    label: 'b',
+    portalBaseUrl: 'x',
+    portalUsername: 'u2',
+    portalPassword: 'p',
+    forwardingEmail: 'SHARED@gmail.com', // same key, different case
+  });
+  assert.notEqual(idA, idB);
+  // Both accounts persist; Gmail-push attribution resolves to whichever comes
+  // first — the other still races via its own portalPoller.
+  assert.equal((await store.findByForwardingEmail('shared@gmail.com')).id, idA);
+  // Updating the SAME account keeps its own forwardingEmail (no false clash).
+  await store.upsert({ id: idA, label: 'a2', portalBaseUrl: 'x', portalUsername: 'u1', portalPassword: 'p', forwardingEmail: 'shared@gmail.com' });
+  assert.equal((await store.findByForwardingEmail('shared@gmail.com')).label, 'a2');
+});
+
+test('upsert rejects registering the same real login (portalUsername+portalBaseUrl) twice', async () => {
+  const store = newStore();
+  const id = await store.upsert({
+    label: 'a',
+    portalBaseUrl: 'https://portal.example.com',
+    portalUsername: 'vendor@gmail.com',
+    portalPassword: 'p',
+  });
+  await assert.rejects(
+    () =>
+      store.upsert({
+        label: 'b',
+        portalBaseUrl: 'https://portal.example.com',
+        portalUsername: 'VENDOR@gmail.com', // same login, different case
+        portalPassword: 'p',
+      }),
+    /already registered/i
+  );
+  // Updating the SAME account keeps its own login (no false clash).
+  await store.upsert({ id, label: 'a2', portalBaseUrl: 'https://portal.example.com', portalUsername: 'vendor@gmail.com', portalPassword: 'p' });
+  assert.equal((await store.get(id)).label, 'a2');
 });
 
 // ── orchestrator: "more creds = more bots" ──────────────────────────────────--
@@ -117,6 +214,49 @@ test('orchestrator.sync is idempotent (no double-spawn)', async () => {
   await orch.shutdown();
 });
 
+test('a failed start() is not retried on every sync — only after the cooldown elapses', async () => {
+  const store = newStore();
+  let attempts = 0;
+  const flakyFactory = (account) => ({
+    account,
+    stats: {},
+    poller: null,
+    async start() {
+      attempts++;
+      if (attempts === 1) throw new Error('otp fetch failed: no code arrived in time');
+    },
+    async stop() {},
+    async handleOrder() {
+      return {};
+    },
+  });
+  const orch = new Orchestrator({
+    store,
+    lock: new MemoryLock(),
+    workerFactory: flakyFactory,
+    startRetryCooldownMs: 20,
+  });
+  await store.upsert({ label: 'a', portalBaseUrl: 'x', portalUsername: 'u', portalPassword: 'p' });
+
+  await orch.sync(); // fails once, enters cooldown
+  assert.equal(attempts, 1);
+  assert.equal(orch.status().length, 0);
+
+  // Simulates the real trigger: an unrelated account mutation calls sync()
+  // again immediately. Within the cooldown this must NOT re-attempt login
+  // (and therefore must not re-trigger an OTP dispatch).
+  await orch.sync();
+  await orch.sync();
+  assert.equal(attempts, 1, 'still on cooldown — no retry, no fresh OTP');
+
+  await new Promise((r) => setTimeout(r, 25));
+  await orch.sync(); // cooldown elapsed — retries and succeeds
+  assert.equal(attempts, 2);
+  assert.equal(orch.status().length, 1);
+
+  await orch.shutdown();
+});
+
 // ── control plane HTTP API ──────────────────────────────────────────────────--
 test('control plane: add account -> bot count increases (auth enforced)', async () => {
   const store = newStore();
@@ -134,7 +274,11 @@ test('control plane: add account -> bot count increases (auth enforced)', async 
   res = await fetch(`${base}/health`);
   assert.equal(res.status, 200);
 
-  // Add an account.
+  // Add an account. The response returns as soon as the record is saved —
+  // orchestrator.sync() (which does the real, potentially slow, login) runs
+  // in the background so the request never blocks on it (see syncInBackground
+  // in server.js). So the bot count is awaited separately, not read off the
+  // create response.
   res = await fetch(`${base}/api/accounts`, {
     method: 'POST',
     headers: { authorization: 'Bearer admintok', 'content-type': 'application/json' },
@@ -142,7 +286,7 @@ test('control plane: add account -> bot count increases (auth enforced)', async 
   });
   assert.equal(res.status, 201);
   const created = await res.json();
-  assert.equal(created.live, 1, 'bot spawned on account add');
+  await waitFor(() => orch.status().length === 1, 'bot spawned on account add');
 
   // List shows it, password redacted.
   res = await fetch(`${base}/api/accounts`, { headers: { authorization: 'Bearer admintok' } });
@@ -150,13 +294,14 @@ test('control plane: add account -> bot count increases (auth enforced)', async 
   assert.equal(listed.accounts.length, 1);
   assert.equal(listed.accounts[0].portalPassword, '***');
 
-  // Deactivate -> bot torn down.
+  // Deactivate -> bot torn down (again, reconciled in the background).
   res = await fetch(`${base}/api/accounts/${created.id}/activate`, {
     method: 'POST',
     headers: { authorization: 'Bearer admintok', 'content-type': 'application/json' },
     body: JSON.stringify({ active: false }),
   });
-  assert.equal((await res.json()).live, 0);
+  assert.equal(res.status, 200);
+  await waitFor(() => orch.status().length === 0, 'bot torn down on deactivate');
 
   await new Promise((r) => server.close(r));
   await orch.shutdown();

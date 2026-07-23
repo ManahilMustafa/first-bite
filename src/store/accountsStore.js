@@ -16,13 +16,21 @@ const SECRET_FIELDS = ['portalPassword', 'gmailRefreshToken'];
  * @property {string} id
  * @property {string} label
  * @property {boolean} active
+ * @property {number} [activatedAt]           epoch ms of the FIRST time this account
+ *                                            went active — the "bot became active"
+ *                                            cutover the dashboard uses to hide
+ *                                            pre-existing inbox history by default
  * @property {string} portalBaseUrl
  * @property {string} portalUsername
  * @property {string} portalPassword          (encrypted on disk)
+ * @property {string} [forwardingEmail]       the user's mailbox orders arrive at;
+ *                                            the attribution key for forwarded email
  * @property {string} [gmailAddress]
- * @property {string} [gmailRefreshToken]     (encrypted on disk)
+ * @property {string} [gmailRefreshToken]     (encrypted on disk; legacy per-account)
  * @property {string} [historyId]
  * @property {number} [pollIntervalMs]
+ * @property {string[]} [regionZipPrefixes]   e.g. ["32","33","34"]
+ * @property {string[]} [regionStates]        e.g. ["FL"] or ["TX"]
  * @property {object} [portalRoutes]
  * @property {object} [portalFields]
  */
@@ -62,16 +70,63 @@ export class AccountsStore {
     return (await this.list()).find((a) => a.id === id) || null;
   }
 
-  /** Add or replace an account (secrets encrypted before write). */
+  /** Find the active account registered for a forwarding address (case-insensitive). */
+  async findByForwardingEmail(email) {
+    if (!email) return null;
+    const needle = String(email).trim().toLowerCase();
+    return (await this.list()).find((a) => a.active && a.forwardingEmail === needle) || null;
+  }
+
+  /**
+   * Add or replace an account (secrets encrypted before write).
+   *
+   * `forwardingEmail` may be shared across multiple accounts on purpose — the
+   * same operator running several vendor logins off one forwarding mailbox to
+   * add more racing bots. Gmail push attribution (`findByForwardingEmail`)
+   * resolves a shared address to whichever of those accounts comes first in
+   * the store; the rest still detect and race independently via their own
+   * `portalPoller`, so nothing silently loses coverage.
+   *
+   * `portalUsername` + `portalBaseUrl` together identify one real login,
+   * though — two account records pointing at the very same login make the
+   * orchestrator log that one portal account in twice on every sync (double
+   * the real login/OTP traffic against it for zero extra racing power, and a
+   * real risk of the portal flagging it). @throws if that pair is already
+   * registered to a DIFFERENT account.
+   */
   async upsert(account) {
     const raw = await this._readRaw();
     const id = account.id || randomUUID();
+    // Normalize the attribution key so header matching (which lowercases) lines up.
+    const normalized = { ...account };
+    if (normalized.forwardingEmail) {
+      normalized.forwardingEmail = String(normalized.forwardingEmail).trim().toLowerCase();
+    }
+    if (normalized.portalUsername && normalized.portalBaseUrl) {
+      const username = String(normalized.portalUsername).trim().toLowerCase();
+      const baseUrl = String(normalized.portalBaseUrl).trim();
+      const clash = raw.find(
+        (a) =>
+          a.id !== id &&
+          String(a.portalUsername || '').trim().toLowerCase() === username &&
+          String(a.portalBaseUrl || '').trim() === baseUrl
+      );
+      if (clash) {
+        throw new Error(
+          `portalUsername ${username} on ${baseUrl} is already registered to account ${clash.id} — this is the same login, not a new vendor account`
+        );
+      }
+    }
     const record = encryptFields(
-      { active: true, pollIntervalMs: undefined, ...account, id },
+      { active: true, pollIntervalMs: undefined, ...normalized, id },
       SECRET_FIELDS,
       this.key
     );
     const idx = raw.findIndex((a) => a.id === id);
+    // Stamp the go-live cutover exactly once: the first time this account is
+    // (or becomes) active. Never overwritten afterward, so later edits/toggles
+    // don't hide orders that already happened while the bot was live.
+    if (record.active && !raw[idx]?.activatedAt) record.activatedAt = Date.now();
     if (idx === -1) raw.push(record);
     else raw[idx] = { ...raw[idx], ...record };
     await this._writeRaw(raw);
@@ -83,16 +138,7 @@ export class AccountsStore {
     const idx = raw.findIndex((a) => a.id === id);
     if (idx === -1) return false;
     raw[idx].active = active;
-    await this._writeRaw(raw);
-    return true;
-  }
-
-  /** Persist an advanced Gmail historyId cursor for an account (by gmail address). */
-  async saveHistoryId(gmailAddress, historyId) {
-    const raw = await this._readRaw();
-    const idx = raw.findIndex((a) => a.gmailAddress === gmailAddress);
-    if (idx === -1) return false;
-    raw[idx].historyId = historyId;
+    if (active && !raw[idx].activatedAt) raw[idx].activatedAt = Date.now();
     await this._writeRaw(raw);
     return true;
   }

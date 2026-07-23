@@ -38,6 +38,18 @@ export class CookieJar {
     if (host) this.byHost.delete(host);
     else this.byHost.clear();
   }
+  /** Plain-object snapshot of every cookie, for persisting across restarts. */
+  export() {
+    const out = {};
+    for (const [host, jar] of this.byHost) out[host] = Object.fromEntries(jar);
+    return out;
+  }
+  /** Restore cookies from a snapshot produced by export(). */
+  import(snapshot) {
+    for (const [host, cookies] of Object.entries(snapshot || {})) {
+      this.byHost.set(host, new Map(Object.entries(cookies)));
+    }
+  }
 }
 
 export class HttpClient {
@@ -51,7 +63,8 @@ export class HttpClient {
     this.jar = jar;
     this.timeoutMs = timeoutMs;
     this.defaultHeaders = {
-      'user-agent': 'Mozilla/5.0 (compatible; EstreetBot/1.0)',
+      'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       ...defaultHeaders,
     };

@@ -3,6 +3,8 @@ import { useAuth } from '../context/AuthContext'
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: '◈' },
+  { to: '/orders', label: 'Orders', icon: '▤' },
+  { to: '/stats', label: 'Statistics', icon: '▦' },
   { to: '/accounts', label: 'Accounts', icon: '◎' },
   { to: '/add-account', label: 'Add Account', icon: '＋' },
 ]
@@ -14,9 +16,9 @@ export function Layout() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="sidebar-brand">
-          <div className="brand-icon">E</div>
+          <div className="brand-icon">F</div>
           <div>
-            <h1>E-Street</h1>
+            <h1>FirstBite</h1>
             <p>Admin Console</p>
           </div>
         </div>

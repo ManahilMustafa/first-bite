@@ -19,7 +19,7 @@ import { URL } from 'node:url';
 export class MockPortal {
   constructor({ username = 'vendor1', password = 'pass1', emailLinkMode = 'standalone' } = {}) {
     this.users = new Map([[username, password]]); // username -> password
-    this.emailLinkMode = emailLinkMode; // 'standalone' | 'needs_login' | 'two_step'
+    this.emailLinkMode = emailLinkMode; // 'standalone' | 'needs_login' | 'needs_login_once' | 'two_step'
     this.orders = new Map(); // id -> { id, status, acceptedBy, address }
     this.sessions = new Map(); // sessionId -> username
     this.issuedViewstate = new Set();
@@ -27,6 +27,9 @@ export class MockPortal {
     this.orderTokens = new Map(); // id -> email-link token
     this.requests = []; // {method, path, ts} for assertions
     this.acceptAttempts = []; // {via, orderId, won}
+    this.emailOtpRequired = false; // simulate the real deployment's mandatory email-OTP step
+    this.otpCode = '123456';
+    this.pendingAuth = new Map(); // pending-auth cookie -> username (post-password, pre-OTP)
     this.server = http.createServer((req, res) => {
       this._handle(req, res).catch((e) => {
         if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' });
@@ -65,14 +68,19 @@ export class MockPortal {
   emailAcceptUrl(id) {
     return `${this.baseUrl}/accept.aspx?order=${encodeURIComponent(id)}&token=${this.orderTokens.get(id).token}`;
   }
+  emailDeclineUrl(id) {
+    return `${this.baseUrl}/decline.aspx?order=${encodeURIComponent(id)}&token=${this.orderTokens.get(id).token}`;
+  }
   orderStatus(id) {
     return this.orders.get(id)?.status;
   }
   reset() {
     this.orders.clear();
     this.sessions.clear();
+    this.pendingAuth.clear();
     this.requests.length = 0;
     this.acceptAttempts.length = 0;
+    this.emailOtpRequired = false;
   }
 
   // ── core: atomic accept ───────────────────────────────────────────────────--
@@ -93,6 +101,25 @@ export class MockPortal {
     return { ok: true };
   }
 
+  // ── core: decline ───────────────────────────────────────────────────────────
+  _tryDecline(id, who, via) {
+    const order = this.orders.get(id);
+    if (!order) {
+      this.acceptAttempts.push({ via, orderId: id, won: false, reason: 'not_found', action: 'decline' });
+      return { ok: false, reason: 'not_found' };
+    }
+    if (order.status === 'accepted') {
+      // Already taken by someone — nothing to decline.
+      this.acceptAttempts.push({ via, orderId: id, won: false, reason: 'taken', action: 'decline' });
+      return { ok: false, reason: 'taken' };
+    }
+    order.status = 'declined';
+    order.declinedBy = who;
+    order.declinedVia = via;
+    this.acceptAttempts.push({ via, orderId: id, won: true, action: 'decline' });
+    return { ok: true };
+  }
+
   // ── request router ────────────────────────────────────────────────────────--
   async _handle(req, res) {
     const u = new URL(req.url, this.baseUrl);
@@ -104,19 +131,47 @@ export class MockPortal {
     const authed = !!sessionUser;
 
     // Login page
-    if (path === '/Account/Login.aspx' && req.method === 'GET') {
+    if (path === '/login.aspx' && req.method === 'GET') {
       return html(res, 200, this._loginPage());
     }
-    if (path === '/Account/Login.aspx' && req.method === 'POST') {
+    if (path === '/login.aspx' && req.method === 'POST') {
       const body = await readForm(req);
-      const user = body['ctl00$MainContent$txtUsername'];
-      const pass = body['ctl00$MainContent$txtPassword'];
+      // Step 2 of 2 (same URL as the real portal): the OTP code, not credentials.
+      if (body['ctl00$cphBody$txtUserCode'] !== undefined) {
+        const pendingId = cookies['PendingAuth'];
+        const pendingUser = pendingId ? this.pendingAuth.get(pendingId) : null;
+        if (!pendingUser || body['ctl00$cphBody$txtUserCode'] !== this.otpCode) {
+          return html(res, 200, this._loginPage('Invalid credentials.'));
+        }
+        this.pendingAuth.delete(pendingId);
+        const newSid = randomUUID();
+        this.sessions.set(newSid, pendingUser);
+        res.writeHead(302, {
+          'set-cookie': [
+            `ASP.NET_SessionId=${newSid}; path=/; HttpOnly`,
+            'PendingAuth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/',
+          ],
+          location: '/AppraiserDashboard.aspx',
+        });
+        return res.end();
+      }
+      const user = body['ctl00$cphBody$Login1$UserName'];
+      const pass = body['ctl00$cphBody$Login1$Password'];
       if (this.users.has(user) && this.users.get(user) === pass) {
+        if (this.emailOtpRequired) {
+          const pendingId = randomUUID();
+          this.pendingAuth.set(pendingId, user);
+          res.writeHead(200, {
+            'content-type': 'text/html; charset=utf-8',
+            'set-cookie': `PendingAuth=${pendingId}; path=/; HttpOnly`,
+          });
+          return res.end(this._otpPage());
+        }
         const newSid = randomUUID();
         this.sessions.set(newSid, user);
         res.writeHead(302, {
           'set-cookie': `ASP.NET_SessionId=${newSid}; path=/; HttpOnly`,
-          location: '/Orders/NewOrders.aspx',
+          location: '/AppraiserDashboard.aspx',
         });
         return res.end();
       }
@@ -124,23 +179,33 @@ export class MockPortal {
     }
 
     // New Orders page (auth-gated)
-    if (path === '/Orders/NewOrders.aspx' && req.method === 'GET') {
+    if (path === '/AppraiserDashboard.aspx' && req.method === 'GET') {
       if (!authed) return redirectToLogin(res);
       return html(res, 200, this._newOrdersPage());
     }
-    if (path === '/Orders/NewOrders.aspx' && req.method === 'POST') {
+    if (path === '/AppraiserDashboard.aspx' && req.method === 'POST') {
       if (!authed) return redirectToLogin(res);
       const body = await readForm(req);
       // Validate WebForms state tokens (faithful: reject forged/stale tokens).
       if (!this.issuedViewstate.has(body.__VIEWSTATE) || !this.issuedEventval.has(body.__EVENTVALIDATION)) {
         return html(res, 200, this._messagePage('Your session has expired. Please refresh.'));
       }
-      const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(body.__EVENTTARGET);
+      // type=image clicks post name.x / name.y instead of __EVENTTARGET.
+      const imageTarget = Object.keys(body).find((k) => k.endsWith('.x'))?.slice(0, -2) || '';
+      const target = body.__EVENTTARGET || imageTarget;
+      const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(target);
       // Test hook: simulate a rival accepting between this client's GET and POST.
       if (this._onBeforeAccept) {
         const hook = this._onBeforeAccept;
         this._onBeforeAccept = null;
         hook(orderId);
+      }
+      if (/decline|reject/i.test(target)) {
+        const d = this._tryDecline(orderId, sessionUser, 'portal');
+        if (d.ok) return html(res, 200, this._messagePage(`Order ${orderId} declined.`));
+        if (d.reason === 'taken')
+          return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+        return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
       }
       const r = this._tryAccept(orderId, sessionUser, 'portal');
       if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
@@ -154,6 +219,12 @@ export class MockPortal {
       const id = u.searchParams.get('order');
       const token = u.searchParams.get('token');
       if (this.emailLinkMode === 'needs_login') return redirectToLogin(res);
+      // Models a transient session expiry: bounces exactly once, then behaves
+      // like 'standalone' (i.e. the retry-after-re-login should succeed).
+      if (this.emailLinkMode === 'needs_login_once') {
+        this.emailLinkMode = 'standalone';
+        return redirectToLogin(res);
+      }
       const rec = this.orderTokens.get(id);
       if (!rec || token !== rec.token) return html(res, 403, this._messagePage('Invalid token.'));
       if (this.emailLinkMode === 'two_step') {
@@ -181,6 +252,23 @@ export class MockPortal {
       if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
       if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
+    }
+
+    // Email decline link
+    if (path === '/decline.aspx' && req.method === 'GET') {
+      const id = u.searchParams.get('order');
+      const token = u.searchParams.get('token');
+      if (this.emailLinkMode === 'needs_login') return redirectToLogin(res);
+      if (this.emailLinkMode === 'needs_login_once') {
+        this.emailLinkMode = 'standalone';
+        return redirectToLogin(res);
+      }
+      const rec = this.orderTokens.get(id);
+      if (!rec || token !== rec.token) return html(res, 403, this._messagePage('Invalid token.'));
+      const r = this._tryDecline(id, rec.user, 'email');
+      if (r.ok) return html(res, 200, this._messagePage(`Order ${id} declined. Thank you.`));
+      if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
+      return html(res, 404, this._messagePage(`Order ${id} not found.`));
     }
 
     // Status page (verifier)
@@ -220,15 +308,25 @@ export class MockPortal {
 
   _loginPage(error = '') {
     return `<!DOCTYPE html><html><head><title>Log In - E-Street</title></head><body>
-      <form method="post" action="/Account/Login.aspx">
+      <form method="post" action="/login.aspx">
         ${this._stateFields()}
         ${error ? `<div class="error">${error}</div>` : ''}
         <label>User Name</label>
-        <input type="text" name="ctl00$MainContent$txtUsername" />
+        <input type="text" name="ctl00$cphBody$Login1$UserName" />
         <label>Password</label>
-        <input type="password" name="ctl00$MainContent$txtPassword" />
+        <input type="password" name="ctl00$cphBody$Login1$Password" />
         <a href="/Account/Forgot.aspx">Forgot your password?</a>
-        <input type="submit" name="ctl00$MainContent$btnLogin" value="Log In" />
+        <input type="submit" name="ctl00$cphBody$Login1$LoginButton" value="Log In" />
+      </form></body></html>`;
+  }
+
+  _otpPage() {
+    return `<!DOCTYPE html><html><head><title>Log In - E-Street</title></head><body>
+      <form method="post" action="/login.aspx">
+        ${this._stateFields()}
+        <p>We have sent a 6 digit verification code to your registered email address.</p>
+        <input type="text" name="ctl00$cphBody$txtUserCode" maxlength="6" placeholder="Enter 6 digit code" />
+        <input type="submit" name="ctl00$cphBody$btnVerifyLogin" value="Verify" />
       </form></body></html>`;
   }
 
@@ -236,20 +334,35 @@ export class MockPortal {
     const available = [...this.orders.values()].filter((o) => o.status === 'available');
     const rows = available
       .map(
-        (o) => `
+        (o, i) => {
+          // Mirror the real E-Street dashboard: Accept/Decline are type=image
+          // ticks (imgBtnBroadcastAccept / imgBtnDecline), not text links.
+          // Order id is embedded in the control name so the POST (.x/.y) can
+          // resolve which row was clicked without a separate EVENTARGUMENT.
+          const ctl = String(i + 2).padStart(2, '0');
+          const acceptName = `ctl00$cphBody$grdNewOrders$ctl${ctl}$imgBtnBroadcastAccept$${o.id}`;
+          const declineName = `ctl00$cphBody$grdNewOrders$ctl${ctl}$imgBtnDecline$${o.id}`;
+          return `
       <tr class="order-row">
         <td class="order-no">Order no. ${o.id}</td>
         <td class="address">${o.address}</td>
         <td>
-          <a href="javascript:__doPostBack('ctl00$MainContent$gvOrders$btnAccept','${o.id}')">Accept</a>
-          <a href="javascript:__doPostBack('ctl00$MainContent$gvOrders$btnDecline','${o.id}')">Decline</a>
+          <input type="image" name="${acceptName}" id="${acceptName.replace(/\$/g, '_')}"
+                 title="Click here to accept this order" src="../images/appraiser-tick.png" />
+          <input type="image" name="${declineName}" id="${declineName.replace(/\$/g, '_')}"
+                 title="Click here to decline this order" src="../images/appraiser-block.png" />
         </td>
-      </tr>`
+      </tr>`;
+        }
       )
       .join('\n');
     return `<!DOCTYPE html><html><head><title>New Orders - E-Street</title></head><body>
       <h1>New Orders</h1>
-      <form method="post" action="/Orders/NewOrders.aspx">
+      <!-- Nav chrome deliberately contains "Accepted"/"In Progress" substrings
+           (like the real portal) so a naive verifier regex would false-positive. -->
+      <a id="ctl00_cphBody_lnkCondAcceptedOrders" href="javascript:__doPostBack('ctl00$cphBody$lnkCondAcceptedOrders','')">Conditionally Accepted Orders</a>
+      <a id="ctl00_cphBody_lnkShowInProgressOrders" href="javascript:__doPostBack('ctl00$cphBody$lnkShowInProgressOrders','')">In Progress Orders</a>
+      <form method="post" action="/AppraiserDashboard.aspx">
         ${this._stateFields()}
         <table id="gvOrders"><tbody>
           ${rows || '<tr><td>No new orders.</td></tr>'}
@@ -278,7 +391,7 @@ export class MockPortal {
 
 // ── helpers ─────────────────────────────────────────────────────────────────--
 function redirectToLogin(res) {
-  res.writeHead(302, { location: '/Account/Login.aspx' });
+  res.writeHead(302, { location: '/login.aspx' });
   res.end();
 }
 function html(res, status, body) {
