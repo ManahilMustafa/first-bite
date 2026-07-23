@@ -5,6 +5,7 @@
 //   GET  /api/accounts                -> list (secrets redacted) + live status
 //   POST /api/accounts                -> add/update an account, then orchestrator.sync()
 //   POST /api/accounts/:id/activate   -> { active:boolean }, then sync()
+//   POST /api/accounts/:id/resume-poller -> clear portal circuit breaker, resume polls
 //   DELETE /api/accounts/:id          -> remove, then sync()
 //   POST /webhooks/gmail              -> Pub/Sub push (verification token in query)
 //   GET  /api/accounts/:id/gmail/auth-url -> OAuth consent URL for this account
@@ -142,6 +143,14 @@ export function createControlPlane({ store, orchestrator, gmailWatcher, connecti
         const ok = await store.setActive(m[1], body.active !== false);
         await orchestrator.sync();
         return json(res, ok ? 200 : 404, { ok, live: orchestrator.status().length });
+      }
+
+      if (method === 'POST' && (m = path.match(/^\/api\/accounts\/([^/]+)\/resume-poller$/))) {
+        const ok = orchestrator.resumePoller(m[1]);
+        return json(res, ok ? 200 : 404, {
+          ok,
+          live: orchestrator.status(),
+        });
       }
 
       if (method === 'DELETE' && (m = path.match(/^\/api\/accounts\/([^/]+)$/))) {

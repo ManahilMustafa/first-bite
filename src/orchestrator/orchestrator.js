@@ -115,13 +115,31 @@ export class Orchestrator {
   }
 
   status() {
-    return [...this.workers.values()].map((w) => ({
-      id: w.account.id,
-      label: w.account.label,
-      username: w.account.portalUsername,
-      stats: w.stats,
-      pollerStats: w.poller?.stats,
-    }));
+    return [...this.workers.values()].map((w) => {
+      const snap = w.poller?.statusSnapshot?.() || null;
+      return {
+        id: w.account.id,
+        label: w.account.label,
+        username: w.account.portalUsername,
+        stats: w.stats,
+        pollerStats: w.poller?.stats,
+        portalPaused: !!snap?.paused,
+        pauseReason: snap?.pauseReason || null,
+        pausedAt: snap?.pausedAt || null,
+        backoffMs: snap?.backoffMs ?? w.account.pollIntervalMs ?? null,
+      };
+    });
+  }
+
+  /**
+   * Resume a paused portal poller for one account (circuit breaker clear).
+   * @param {string} accountId
+   * @returns {boolean}
+   */
+  resumePoller(accountId) {
+    const worker = this.workers.get(accountId);
+    if (!worker) return false;
+    return worker.resumePortalPoller();
   }
 }
 

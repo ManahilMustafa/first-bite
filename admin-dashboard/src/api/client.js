@@ -43,6 +43,11 @@ export async function setAccountActive(id, active) {
   return data
 }
 
+export async function resumePoller(id) {
+  const { data } = await client.post(`/api/accounts/${id}/resume-poller`)
+  return data
+}
+
 export async function deleteAccount(id) {
   const { data } = await client.delete(`/api/accounts/${id}`)
   return data

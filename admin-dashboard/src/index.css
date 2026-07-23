@@ -416,6 +416,11 @@ input {
   color: var(--danger);
 }
 
+.badge-paused {
+  background: #fff7ed;
+  color: #c2410c;
+}
+
 /* Buttons */
 
 .btn {

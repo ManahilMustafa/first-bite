@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getHealth } from '../api/client'
 import { StatCard } from '../components/StatCard'
+import { StatusBadge } from '../components/StatusBadge'
 import { useAccounts } from '../hooks/useAccounts'
 
 export function Dashboard() {
@@ -92,12 +93,23 @@ export function Dashboard() {
                 <div>
                   <strong>{w.label || w.username}</strong>
                   <span className="muted">{w.username}</span>
+                  {w.portalPaused && (
+                    <StatusBadge variant="paused">Portal paused</StatusBadge>
+                  )}
                 </div>
                 <div className="worker-stats">
                   <span>Detected: {w.stats?.detected ?? 0}</span>
                   <span>Accepted: {w.stats?.accepted ?? 0}</span>
                   <span>Declined: {w.stats?.declined ?? 0}</span>
                   <span>Polls: {w.pollerStats?.polls ?? 0}</span>
+                  {w.portalPaused && w.pauseReason && (
+                    <span className="muted" title={w.pauseReason}>
+                      Reason: {String(w.pauseReason).slice(0, 48)}
+                    </span>
+                  )}
+                  {w.backoffMs != null && w.backoffMs !== w.pollerStats?.intervalMs && !w.portalPaused && (
+                    <span>Backoff: {w.backoffMs}ms</span>
+                  )}
                 </div>
               </div>
             ))}

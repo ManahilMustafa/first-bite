@@ -4,6 +4,9 @@ import { MockPortal } from './mocks/mockPortal.js';
 import { AccountWorker } from '../src/worker/worker.js';
 import { MemoryLock } from '../src/lock/memoryLock.js';
 
+// Integration tests use sub-second polls; disable the production floor.
+process.env.PORTAL_POLL_FLOOR_MS = '0';
+
 let portal;
 before(async () => {
   portal = new MockPortal({ username: 'vendor1', password: 'pass1' });

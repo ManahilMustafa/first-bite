@@ -9,7 +9,7 @@ const initialForm = {
   portalPassword: '',
   portalBaseUrl: '',
   forwardingEmail: '',
-  pollIntervalMs: '2000',
+  pollIntervalMs: '10000',
   regionZipPrefixes: '',
   regionStates: '',
 }
@@ -34,7 +34,7 @@ export function AddAccount() {
       portalUsername: form.portalUsername.trim(),
       portalPassword: form.portalPassword,
       portalBaseUrl: form.portalBaseUrl.trim(),
-      pollIntervalMs: Number(form.pollIntervalMs) || 2000,
+      pollIntervalMs: Number(form.pollIntervalMs) || 10000,
     }
 
     if (form.forwardingEmail.trim()) {
@@ -132,12 +132,14 @@ export function AddAccount() {
               <input
                 id="pollIntervalMs"
                 type="number"
-                min={500}
-                step={100}
+                min={5000}
+                step={1000}
                 value={form.pollIntervalMs}
                 onChange={(e) => updateField('pollIntervalMs', e.target.value)}
               />
-              <span className="field-hint">Lower = faster detection, higher ban risk</span>
+              <span className="field-hint">
+                Default 10000. Lower = faster detection, higher ban risk. Server floors at 5000ms.
+              </span>
             </div>
           </div>
         </section>

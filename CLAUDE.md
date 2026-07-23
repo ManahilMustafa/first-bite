@@ -158,7 +158,9 @@ is loaded by a tiny hand-rolled loader in [src/index.js](src/index.js) (no `dote
 
 Per-account records (`POST /api/accounts`) carry the portal credentials,
 `forwardingEmail` (the attribution key — the mailbox the user's orders are forwarded
-from), `regionZipPrefixes`/`regionStates`, `pollIntervalMs` (the latency/ban-risk dial),
+from), `regionZipPrefixes`/`regionStates`, `pollIntervalMs` (latency/ban-risk dial;
+default/floor prefer ≥10s / 5s; 5× 403/429 → circuit pause portal polls, Gmail continues;
+see HOSTINGER.md for VPS IP change),
 and `portalRoutes`/`portalFields` overrides. The central Gmail is connected **once** via
 `GET /api/gmail/auth-url` → OAuth callback (writes the single
 [GmailConnectionStore](src/store/gmailConnection.js)); `GET /api/gmail/status` reports it.

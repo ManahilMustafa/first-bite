@@ -29,6 +29,20 @@ const DEFAULT_FIELDS = {
   submitValue: 'Log In',
 };
 
+/** Thrown when the portal returns a hard throttle / forbid status. */
+export class PortalHttpError extends Error {
+  /**
+   * @param {number} status
+   * @param {string} [message]
+   */
+  constructor(status, message) {
+    super(message || `Portal HTTP ${status}`);
+    this.name = 'PortalHttpError';
+    this.status = status;
+    this.isThrottle = status === 403 || status === 429;
+  }
+}
+
 export class PortalSession {
   /**
    * @param {object} cfg
@@ -72,6 +86,7 @@ export class PortalSession {
   async _doLogin() {
     const loginUrl = this.url(this.routes.login);
     const page = await this.http.get(loginUrl, { followRedirects: true });
+    this._assertNotThrottled(page);
     const hidden = scrapeHiddenFields(page.body);
     const body = {
       ...hidden,
@@ -84,6 +99,7 @@ export class PortalSession {
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       followRedirects: true,
     });
+    this._assertNotThrottled(res);
 
     // Success = we landed somewhere that is NOT the login page.
     const ok = !looksLikeLogin(res.body) && res.status < 400;
@@ -103,6 +119,7 @@ export class PortalSession {
   async authedGet(path, { retried = false } = {}) {
     if (!this.authenticated) await this.login();
     const res = await this.http.get(this.url(path), { followRedirects: true });
+    this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
       this.log.warn('session expired, re-authenticating');
       this.authenticated = false;
@@ -119,12 +136,19 @@ export class PortalSession {
       headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
       followRedirects: true,
     });
+    this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
       this.authenticated = false;
       await this.login();
       return this.authedPost(path, body, { retried: true, headers });
     }
     return res;
+  }
+
+  _assertNotThrottled(res) {
+    if (res?.status === 403 || res?.status === 429) {
+      throw new PortalHttpError(res.status, `Portal HTTP ${res.status}`);
+    }
   }
 
   _isBounced(res) {

@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
-import { deleteAccount, getGmailAuthUrl, getGmailStatus, setAccountActive } from '../api/client'
+import { deleteAccount, getGmailAuthUrl, getGmailStatus, resumePoller, setAccountActive } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import { useAccounts } from '../hooks/useAccounts'
-import { formatRegion, isWorkerLive, maskEmail } from '../utils/format'
+import { formatRegion, getLiveWorker, isWorkerLive, maskEmail } from '../utils/format'
 
 export function Accounts() {
   const { accounts, live, loading, error, lastUpdated, refresh } = useAccounts()
@@ -47,6 +47,19 @@ export function Accounts() {
     setActionError(null)
     try {
       await setAccountActive(account.id, !account.active)
+      await refresh()
+    } catch (err) {
+      setActionError(err.response?.data?.error || err.message)
+    } finally {
+      setActionId(null)
+    }
+  }
+
+  async function handleResumePoller(account) {
+    setActionId(account.id)
+    setActionError(null)
+    try {
+      await resumePoller(account.id)
       await refresh()
     } catch (err) {
       setActionError(err.response?.data?.error || err.message)
@@ -142,7 +155,9 @@ export function Accounts() {
                 </tr>
               ) : (
                 accounts.map((account) => {
+                  const worker = getLiveWorker(account.id, live)
                   const workerLive = isWorkerLive(account.id, live)
+                  const portalPaused = !!worker?.portalPaused
                   const busy = actionId === account.id
                   return (
                     <tr key={account.id}>
@@ -164,13 +179,28 @@ export function Accounts() {
                         </StatusBadge>
                       </td>
                       <td>
-                        <StatusBadge variant={workerLive ? 'live' : 'stopped'}>
-                          {workerLive ? 'Live' : 'Stopped'}
-                        </StatusBadge>
+                        {portalPaused ? (
+                          <StatusBadge variant="paused">Paused</StatusBadge>
+                        ) : (
+                          <StatusBadge variant={workerLive ? 'live' : 'stopped'}>
+                            {workerLive ? 'Live' : 'Stopped'}
+                          </StatusBadge>
+                        )}
                       </td>
                       <td>{account.pollIntervalMs ?? '—'}</td>
                       <td>
                         <div className="row-actions">
+                          {portalPaused && (
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-primary"
+                              disabled={busy}
+                              onClick={() => handleResumePoller(account)}
+                              title={worker?.pauseReason || 'Resume portal polling'}
+                            >
+                              {busy ? '…' : 'Resume poll'}
+                            </button>
+                          )}
                           <button
                             type="button"
                             className={`btn btn-sm ${account.active ? 'btn-secondary' : 'btn-primary'}`}

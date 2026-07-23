@@ -24,7 +24,7 @@ the whole game, so the bot runs **two detectors** and **races two accept paths**
 | Layer | File | Tested |
 |---|---|---|
 | Email parser (ValueLink order emails) | [src/detect/emailParser.js](src/detect/emailParser.js) | ✅ |
-| Portal poller (bounded detector) | [src/detect/portalPoller.js](src/detect/portalPoller.js) | ✅ (integration) |
+| Portal poller (bounded detector) | [src/detect/portalPoller.js](src/detect/portalPoller.js) | ✅ (integration + safety) |
 | Central Gmail watcher (single inbox) | [src/detect/gmailWatcher.js](src/detect/gmailWatcher.js) | ✅ (mocked fetch) |
 | Forwarded-email attribution (header → user) | [src/detect/attribution.js](src/detect/attribution.js) | ✅ |
 | Authenticated portal session | [src/portal/session.js](src/portal/session.js) | ✅ |
@@ -149,6 +149,12 @@ system-wide connection (see "Central inbox" below).
 
 See [.env.example](.env.example) for global settings (encryption key, lock
 backend, poll interval, Gmail OAuth/Pub/Sub).
+
+**Portal safety:** default poll is **10s** (floored at 5s). Repeated 403/429/timeouts
+open a per-account **circuit breaker** that pauses portal polling while Gmail
+detection continues. Resume via dashboard **Resume poll** or
+`POST /api/accounts/:id/resume-poller`. Hostinger IP-change runbook:
+[HOSTINGER.md](HOSTINGER.md).
 
 ### Per-user region filtering (accept vs decline)
 
