@@ -9,7 +9,7 @@ const initialForm = {
   portalPassword: '',
   portalBaseUrl: '',
   forwardingEmail: '',
-  pollIntervalMs: '2000',
+  pollIntervalMs: '10000',
   regionZipPrefixes: '',
   regionStates: '',
 }
@@ -77,7 +77,7 @@ export function AddAccount() {
       label: form.label.trim(),
       portalUsername: form.portalUsername.trim(),
       portalBaseUrl: form.portalBaseUrl.trim(),
-      pollIntervalMs: Number(form.pollIntervalMs) || 2000,
+      pollIntervalMs: Number(form.pollIntervalMs) || 10000,
     }
     if (editing) payload.id = editId
     if (form.portalPassword) payload.portalPassword = form.portalPassword
@@ -236,7 +236,7 @@ export function AddAccount() {
                   value={form.pollIntervalMs}
                   onChange={(e) => updateField('pollIntervalMs', e.target.value)}
                 />
-                <span className="field-hint">Lower = faster detection, higher ban risk</span>
+                <span className="field-hint">Lower = faster detection, higher ban risk. Server floors very aggressive values.</span>
               </div>
             </div>
           </section>

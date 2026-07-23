@@ -27,3 +27,7 @@ export function parseCsvList(value, uppercase = false) {
 export function isWorkerLive(accountId, liveWorkers) {
   return liveWorkers.some((w) => w.id === accountId)
 }
+
+export function getLiveWorker(accountId, liveWorkers) {
+  return liveWorkers.find((w) => w.id === accountId) || null
+}

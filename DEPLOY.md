@@ -190,7 +190,10 @@ sudo systemctl restart estreet
 ```
 
 ## Notes
-- **Firewall:** open 80 + 443 (Caddy needs 80 for cert issuance).
+- **Firewall:** open 80 + 443 (Caddy needs 80 for cert issuance). Do **not** expose
+  Vite `:5173` to the public internet — serve `admin-dashboard/dist` behind Caddy.
+- **Hostinger IP change:** see [HOSTINGER.md](HOSTINGER.md) (new VPS / support /
+  rebuild) and the post-IP safe restart checklist (poll ≥10s, dry-run, circuit breaker).
 - **Multi-process fleet:** set `LOCK_BACKEND=redis` + `REDIS_URL`, run `npm install` (pulls
   the optional `redis`), so the exactly-once lock is shared across processes.
 - **Secrets:** keep `.env` out of git (already in `.gitignore`); rotate

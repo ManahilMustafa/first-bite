@@ -86,6 +86,14 @@ export class AccountWorker {
     this.log.info('worker started', { account: this.account.portalUsername });
   }
 
+  /** Clear portal poller circuit breaker and resume polling. */
+  resumePortalPoller() {
+    if (!this.poller) return false;
+    this.poller.resume();
+    this.log.info('portal poller resume requested');
+    return true;
+  }
+
   /**
    * Entry point for ANY detector (portal poller OR gmail watcher). Applies THIS
    * account's region rule, then either accepts (in-region) or actively declines

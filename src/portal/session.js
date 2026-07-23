@@ -43,6 +43,20 @@ const DEFAULT_OTP_FIELDS = {
   submitValue: 'Verify',
 };
 
+/** Thrown when the portal returns a hard throttle / forbid status (403/429). */
+export class PortalHttpError extends Error {
+  /**
+   * @param {number} status
+   * @param {string} [message]
+   */
+  constructor(status, message) {
+    super(message || `Portal HTTP ${status}`);
+    this.name = 'PortalHttpError';
+    this.status = status;
+    this.isThrottle = status === 403 || status === 429;
+  }
+}
+
 export class PortalSession {
   /**
    * @param {object} cfg
@@ -155,6 +169,7 @@ export class PortalSession {
     this.http.jar.clear();
     const loginUrl = this.url(this.routes.login);
     const page = await this.http.get(loginUrl, { followRedirects: true });
+    this._assertNotThrottled(page);
     // Post back to the URL we actually landed on (after redirects), not the
     // pre-redirect loginUrl — ViewState is bound to that page.
     const postUrl = page.url || loginUrl;
@@ -181,6 +196,7 @@ export class PortalSession {
       },
       followRedirects: true,
     });
+    this._assertNotThrottled(res);
 
     if (looksLikeOtpPage(res.body)) {
       res = await this._submitOtp(postUrl, res.body, attemptedAt);
@@ -264,6 +280,7 @@ export class PortalSession {
       }
       throw e;
     }
+    this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
       this.log.warn('login required', { path });
       this.log.info('re-authenticating');
@@ -287,6 +304,7 @@ export class PortalSession {
       headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
       followRedirects: true,
     });
+    this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
       this.log.warn('login required', { path });
       this.log.info('re-authenticating');
@@ -297,6 +315,12 @@ export class PortalSession {
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     return res;
+  }
+
+  _assertNotThrottled(res) {
+    if (res?.status === 403 || res?.status === 429) {
+      throw new PortalHttpError(res.status, `Portal HTTP ${res.status}`);
+    }
   }
 
   _isBounced(res) {

@@ -509,6 +509,11 @@ input {
   color: var(--danger);
 }
 
+.badge-paused {
+  background: #fff7ed;
+  color: #c2410c;
+}
+
 /* Order status chip — a badge + a tooltip with the plain-language reason
    (computed server-side; this is presentation only). Opens on hover/focus for
    mouse+keyboard, and on tap (click) for touch devices where hover doesn't
