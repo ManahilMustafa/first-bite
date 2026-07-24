@@ -100,6 +100,7 @@ export class PortalPoller {
     this._cooldownTimer = null;
     this._running = false;
     this._stopped = false;
+    this._lastPollAt = null;
     this.paused = false;
     this.pauseReason = null;
     this.pausedAt = null;
@@ -204,6 +205,10 @@ export class PortalPoller {
   async _tick() {
     if (this._running || this._stopped || this.paused) return;
     this._running = true;
+    // Bound for portal detection latency: order wasn't present as of the last
+    // successful poll start. First tick has no anchor (null is honest).
+    const previousPollAt = this._lastPollAt;
+    this._lastPollAt = Date.now();
     const t0 = process.hrtime.bigint();
     try {
       const page = await this.session.authedGet(this.newOrdersPath);
@@ -222,6 +227,7 @@ export class PortalPoller {
               address,
               zip: meta.zip,
               state: meta.state,
+              previousPollAt,
             });
           } catch (e) {
             this.log.error('onOrder handler threw', { err: String(e) });
