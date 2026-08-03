@@ -1,16 +1,16 @@
-// Order-status verifier — reads the source of truth (the portal) to confirm an
-// accept actually landed. Used by the executor after the race, and standalone
-// for reconciliation. Returns 'accepted' | 'taken' | 'available' | 'unknown'.
+// Order-status verifier — reads the portal to confirm an accept landed.
+// Returns 'accepted' | 'taken' | 'available' | 'unknown'.
 //
-// IMPORTANT: these patterns must NOT match nav chrome / menu link ids. The real
-// E-Street dashboard has links like `lnkCondAcceptedOrders` and
-// `lnkShowInProgressOrders` — a naive /accepted|in progress/i match on any page
-// falsely reports every order as accepted (the 2026-07-21 production lie).
-const ACCEPTED_RE =
-  /\b(?:order\s+\S+\s+)?(?:accepted by vendor|accepted by you|assigned to you)\b|\bstatus:\s*in progress\b|\bin progress\.\s*$/im;
-const TAKEN_RE =
-  /\bassigned to (?:another|other)(?:\s+vendor)?\b|\bno longer available\b|\breassigned\b/i;
-const AVAILABLE_RE = /\b(?:available|pending acceptance|awaiting(?:\s+acceptance)?)\b/i;
+// Dashboard "Accepted" must only follow a real portal confirmation. The default
+// status URL is often wrong on E-Street, so we also:
+//   1) inspect the New Orders row (still has Accept tick? → available)
+//   2) open In Progress Orders when possible and look for the order near
+//      "Accepted by Vendor" / "In Progress" / "File In Review"
+import {
+  buildControlClick,
+  findPostbackTarget,
+} from '../portal/aspnet.js';
+import { looksAccepted, looksAvailable, looksTaken } from './signals.js';
 
 /**
  * @param {import('../portal/session.js').PortalSession} session
@@ -18,20 +18,96 @@ const AVAILABLE_RE = /\b(?:available|pending acceptance|awaiting(?:\s+acceptance
  */
 export function makePortalVerifier(session) {
   return async function verify(orderId) {
-    if (!session.routes.status) return 'unknown';
-    try {
-      const res = await session.authedGet(session.routes.status(orderId));
-      const body = res.body || '';
-      // Prefer taken over accepted: a page that mentions both (e.g. nav + body)
-      // must not invent a win for us.
-      if (TAKEN_RE.test(body)) return 'taken';
-      if (ACCEPTED_RE.test(body)) return 'accepted';
-      if (AVAILABLE_RE.test(body)) return 'available';
-      return 'unknown';
-    } catch {
-      return 'unknown';
+    if (!orderId) return 'unknown';
+
+    // 1) Dedicated status route (when the portal actually implements it).
+    if (typeof session.routes?.status === 'function') {
+      try {
+        const res = await session.authedGet(session.routes.status(orderId));
+        const hit = classifyStatusHtml(res.body || '', orderId);
+        if (hit) return hit;
+      } catch {
+        /* fall through */
+      }
     }
+
+    // 2) New Orders — if our Accept tick is still there, we did NOT win.
+    try {
+      const page = await session.authedGet(session.routes.newOrders);
+      const html = page.body || '';
+      const onNew = classifyNearOrder(html, orderId);
+      if (onNew === 'available') return 'available';
+      if (onNew === 'taken') return 'taken';
+      if (onNew === 'accepted') return 'accepted';
+
+      // 3) Order left New Orders → check In Progress list (real E-Street home).
+      if (!html.includes(orderId)) {
+        const inProg = await fetchInProgressHtml(session, html);
+        if (inProg) {
+          const hit = classifyNearOrder(inProg, orderId);
+          if (hit) return hit;
+          // Whole-page accepted signals only when the order id is present.
+          if (inProg.includes(orderId) && looksAccepted(inProg) && !looksTaken(inProg)) {
+            return 'accepted';
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return 'unknown';
   };
+}
+
+/**
+ * Classify a status/details page body.
+ * @returns {'accepted'|'taken'|'available'|null}
+ */
+export function classifyStatusHtml(body, orderId) {
+  if (looksTaken(body)) return 'taken';
+  if (looksAccepted(body)) return 'accepted';
+  if (looksAvailable(body)) return 'available';
+  return classifyNearOrder(body, orderId);
+}
+
+/**
+ * Look at a window around the order id (row / card), not the whole page nav.
+ * @returns {'accepted'|'taken'|'available'|null}
+ */
+export function classifyNearOrder(html, orderId) {
+  if (!html || !orderId) return null;
+  const idx = html.indexOf(orderId);
+  if (idx === -1) return null;
+  const win = html.slice(idx, idx + 3500);
+  if (/assigned to another|no longer available|reassigned/i.test(win)) return 'taken';
+  // Still on the broadcast list with an Accept control → not ours yet.
+  if (/imgBtnBroadcastAccept|BroadcastAccept/i.test(win)) return 'available';
+  if (
+    /accepted by vendor|accepted by you|assigned to you|\bfile in review\b|\bin progress\b/i.test(
+      win
+    )
+  ) {
+    return 'accepted';
+  }
+  return null;
+}
+
+/** Best-effort: post the "In Progress Orders" nav link from the current page. */
+async function fetchInProgressHtml(session, newOrdersHtml) {
+  const pb =
+    findPostbackTarget(newOrdersHtml, /in\s*progress\s*orders/i) ||
+    findPostbackTarget(newOrdersHtml, /show\s*in\s*progress/i);
+  if (!pb) return null;
+  const tgt = pb.target || '';
+  if (!/InProgress|ShowInProgress|inprogress/i.test(tgt)) return null;
+  try {
+    const body = buildControlClick(newOrdersHtml, pb);
+    const res = await session.authedPost(session.routes.newOrders, body);
+    return res.body || '';
+  } catch {
+    return null;
+  }
 }
 
 export default makePortalVerifier;

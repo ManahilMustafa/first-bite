@@ -79,11 +79,11 @@ test('reported events carry the full latency-report instrumentation (detection/l
   });
   try {
     await worker.start();
-    // Let at least one real poll tick run first so the poller has a genuine
-    // previousPollAt to anchor detectionLatencyMs to (the very first tick right
-    // after start() legitimately has none yet — "no anchor, no number" is
-    // correct there, not a bug — so we sidestep that edge case here).
-    await new Promise((r) => setTimeout(r, 80));
+    // Wait until a poll tick has actually finished so previousPollAt is set.
+    // A fixed sleep races the full suite under load (first tick still in-flight
+    // → detectionLatencyMs stays null → typeof null === 'object').
+    const primed = await waitFor(() => worker.poller?._lastPollAt != null, 2000);
+    assert.equal(primed, true, 'poller should complete at least one tick before we add an order');
     portal.addOrder('266-09000', { address: '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613' });
 
     const ok = await waitFor(() => events.length >= 1, 5000);

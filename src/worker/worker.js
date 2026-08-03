@@ -4,6 +4,10 @@
 // Gmail detector feeds in externally via onOrder), its historyId cursor. Shares
 // only the Redis lock (exactly-once) with the rest of the fleet. Designed to run
 // as its own process/container so a crash/revocation only takes down this one.
+//
+// One session for poll + accept so the poller's fresh New Orders HTML can be
+// reused on the accept postback (skips a GET on the hot path). Session HTTP is
+// serialized via PortalSession._exclusive.
 import { PortalSession } from '../portal/session.js';
 import { PortalPoller } from '../detect/portalPoller.js';
 import { executeAccept } from '../accept/acceptExecutor.js';
@@ -31,12 +35,16 @@ export class AccountWorker {
   constructor({ account, lock, portalOpts = {}, poll = true, onResult, fetchOtpCode, cookieStore, log = logger }) {
     this.account = account;
     this.lock = lock;
-    // account.reuseCachedPage is an explicit per-account opt-in (default off —
-    // see portalAccept.js's doc comment for the full safety argument) to skip
-    // the fresh GET before an accept/decline postback when the poller *just*
-    // fetched this exact page. portalOpts (constructor param) can still
-    // override it, e.g. for tests.
-    this.portalOpts = { reuseCachedPage: !!account.reuseCachedPage, ...portalOpts };
+    const reuseCachedPage =
+      !!account.reuseCachedPage || String(process.env.REUSE_CACHED_PAGE || '') === '1';
+    const acceptTimeoutMs = Number(process.env.ACCEPT_HTTP_TIMEOUT_MS);
+    this.portalOpts = {
+      reuseCachedPage,
+      ...(Number.isFinite(acceptTimeoutMs) && acceptTimeoutMs > 0
+        ? { timeoutMs: acceptTimeoutMs }
+        : {}),
+      ...portalOpts,
+    };
     this.enablePoll = poll;
     this.onResult = onResult;
     this.log = log(`worker:${account.label || account.id || account.portalUsername}`);
@@ -99,28 +107,30 @@ export class AccountWorker {
    * account's region rule, then either accepts (in-region) or actively declines
    * (out-of-region). Wins the lock → races strategy paths → verifies → reports.
    * Idempotent per order via the lock.
-   * @param {{orderId:string, acceptUrl?:string, declineUrl?:string,
-   *          address?:string, zip?:string, state?:string, source:string}} order
    */
   async handleOrder(order) {
-    const { orderId, acceptUrl, declineUrl, source, address, zip, state, forwardingEmail, emailReceivedAt, previousPollAt } = order;
+    const {
+      orderId,
+      acceptUrl,
+      declineUrl,
+      source,
+      address,
+      zip,
+      state,
+      forwardingEmail,
+      emailReceivedAt,
+      previousPollAt,
+      prefetchedPage,
+    } = order;
     const detectedAt = Date.now();
     this.stats.detected++;
     this.log.info('order detected', { orderId, source, account: this.account.label, address, zip, state });
 
-    // Detection latency: how long between the order actually becoming
-    // available and us noticing it. Gmail gives an honest anchor
-    // (emailReceivedAt — Gmail's own receipt timestamp for the message); the
-    // portal poller only gives an upper bound (previousPollAt, the last
-    // confirmed moment it WASN'T listed yet — actual latency is somewhere
-    // between 0 and detectedAt-previousPollAt). Never reported beyond what
-    // these real anchors support — no anchor, no number.
     let detectionLatencyMs = null;
     if (emailReceivedAt) detectionLatencyMs = detectedAt - emailReceivedAt;
     else if (previousPollAt) detectionLatencyMs = detectedAt - previousPollAt;
 
     const region = orderMatchesRegion(this.account, { address, zip, state });
-    // Location/identity stamped on every reported event (for the orders feed).
     const meta = {
       orderId,
       source,
@@ -132,12 +142,6 @@ export class AccountWorker {
       forwardingEmail: forwardingEmail ?? this.account.forwardingEmail ?? null,
     };
 
-    // Out-of-region but we couldn't evaluate every configured rule (missing
-    // ZIP/state signal) → do NOT act. Declining on a guess could wrongly reject
-    // an in-region order. We intentionally do NOT take the lock here: a no-signal
-    // detection must never block a better-informed detection of the same order
-    // (which would cause a MISSED order). The better-informed detection will
-    // acquire the lock and act.
     if (!region.allowed && !region.decided) {
       this.stats.regionUnknown++;
       this.log.warn('region matched: undetermined — not acting', { orderId, source, meta: region.meta });
@@ -158,8 +162,6 @@ export class AccountWorker {
       meta: region.meta,
     });
 
-    // Exactly-once across the fleet. Accept and decline share the key, so the two
-    // detectors can never both act on the same (account, order).
     const key = orderLockKey(`${this.account.id || this.account.portalUsername}:${orderId}`);
     const lockStartedAt = Date.now();
     const won = await this.lock.acquire(key);
@@ -167,17 +169,13 @@ export class AccountWorker {
     if (!won) {
       this.stats.deduped++;
       this.log.debug('order already in flight, skipping', { orderId, source });
-      // Deduped detections are not recorded (they're the same order seen again).
       return { ...meta, action: region.allowed ? 'accept' : 'decline', deduped: true };
     }
 
     let event = region.allowed
-      ? await this._accept({ orderId, acceptUrl, source })
-      : await this._decline({ orderId, declineUrl, source, region });
+      ? await this._accept({ orderId, acceptUrl, source, prefetchedPage })
+      : await this._decline({ orderId, declineUrl, source, region, prefetchedPage });
     const totalMs = Date.now() - detectedAt;
-    // Enrich with location/identity for the feed, plus the full stage-by-stage
-    // latency breakdown — this is what src/util/latencyReport.js reads to find
-    // the real bottleneck instead of guessing at one.
     event = {
       ...event,
       address: meta.address,
@@ -192,15 +190,12 @@ export class AccountWorker {
       totalMs,
     };
 
-    // Keep the key for its TTL once we successfully acted (so a late duplicate
-    // can't re-fire); release it on failure so a retry can try again.
     const acted = event.accepted || event.declined;
     if (!acted) await this.lock.release(key);
 
     return this._report(event);
   }
 
-  /** Fire the result callback (metrics / event log) and return the event. */
   _report(event) {
     if (this.onResult) {
       try {
@@ -212,7 +207,7 @@ export class AccountWorker {
     return event;
   }
 
-  async _accept({ orderId, acceptUrl, source }) {
+  async _accept({ orderId, acceptUrl, source, prefetchedPage }) {
     this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
     let result;
     try {
@@ -220,7 +215,7 @@ export class AccountWorker {
         orderId,
         acceptUrl,
         session: this.session,
-        portalOpts: this.portalOpts,
+        portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
         verify: this.verify,
         log: this.log.child('accept'),
       });
@@ -234,7 +229,7 @@ export class AccountWorker {
     return { ...result, action: 'accept', declined: false, orderId, source, account: this.account.portalUsername };
   }
 
-  async _decline({ orderId, declineUrl, source, region }) {
+  async _decline({ orderId, declineUrl, source, region, prefetchedPage }) {
     this.log.info('declining out-of-region order', {
       orderId,
       source,
@@ -248,7 +243,7 @@ export class AccountWorker {
         orderId,
         declineUrl,
         session: this.session,
-        portalOpts: this.portalOpts,
+        portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
         verify: this.verify,
         log: this.log.child('decline'),
       });

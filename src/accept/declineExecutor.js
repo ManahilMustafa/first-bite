@@ -21,6 +21,7 @@ import { logger } from '../util/logger.js';
  * @param {import('../portal/session.js').PortalSession} [opts.session] enables Path B + verify
  * @param {object} [opts.portalOpts]                passed to declineViaPortal
  * @param {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>} [opts.verify]
+ * @param {()=>void} [opts.onAfterRace]  see acceptExecutor — release poller before verify
  * @param {object} [opts.log]
  * @returns {Promise<{declined:boolean, via:string|null, outcome:string,
  *                    durationMs:number, paths:object, verified:string|null}>}
@@ -31,6 +32,7 @@ export async function executeDecline({
   session,
   portalOpts = {},
   verify,
+  onAfterRace,
   log = logger('decline'),
 }) {
   const startedAt = process.hrtime.bigint();
@@ -59,8 +61,14 @@ export async function executeDecline({
     paths[name] = result;
     return result?.ok === true;
   });
+  await Promise.all(tasks);
 
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  try {
+    onAfterRace?.();
+  } catch (e) {
+    log.warn('onAfterRace threw', { orderId, err: String(e) });
+  }
 
   let via = null;
   let outcome = 'failed';

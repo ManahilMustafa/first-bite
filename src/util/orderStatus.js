@@ -97,12 +97,25 @@ function classifyUnresolved(e, now) {
     return fresh
       ? {
           status: STATUS.PENDING,
-          reason: "We submitted a decline for this order but haven't been able to confirm the portal accepted it yet.",
+          reason:
+            e.action === 'decline'
+              ? "We submitted a decline for this order but haven't been able to confirm the portal accepted it yet."
+              : "We tried to accept this order but haven't confirmed it on the portal yet — check the portal before assuming it's yours.",
         }
       : {
           status: STATUS.FAILED,
-          reason: 'We submitted a decline for this order but were never able to confirm it went through. Please check the portal directly.',
+          reason:
+            e.action === 'decline'
+              ? 'We submitted a decline for this order but were never able to confirm it went through. Please check the portal directly.'
+              : "We couldn't confirm this order was accepted on the portal. Please check the portal directly — it is not marked Accepted here.",
         };
+  }
+
+  if (e.outcome === 'still_available') {
+    return {
+      status: STATUS.FAILED,
+      reason: 'The portal still showed this order as available after we tried to accept it, so it was not marked as accepted.',
+    };
   }
 
   if (e.outcome === 'taken') {

@@ -100,6 +100,35 @@ export class PortalSession {
     // fresh GET and replay a *very* recently seen page's VIEWSTATE directly.
     // Never used unless a caller explicitly asks for it and checks freshness.
     this._pageCache = new Map(); // path -> { body, status, ts }
+    // ASP.NET WebForms + one cookie jar: concurrent poller GET + Accept POST
+    // on the same session can corrupt server state → Error.aspx. Serialize.
+    this._httpGate = Promise.resolve();
+    this._gateDepth = 0;
+  }
+
+  /**
+   * Run portal HTTP exclusively for this account session (re-entrant so
+   * authedGet → login → http still works inside one hold).
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _exclusive(fn) {
+    if (this._gateDepth > 0) return fn();
+    let release;
+    const done = new Promise((r) => {
+      release = r;
+    });
+    const prev = this._httpGate;
+    this._httpGate = done;
+    await prev;
+    this._gateDepth++;
+    try {
+      return await fn();
+    } finally {
+      this._gateDepth--;
+      release();
+    }
   }
 
   /** A recent successful GET response for `path`, if not older than `maxAgeMs`. */
@@ -267,15 +296,19 @@ export class PortalSession {
    * respond; a single retry is cheap relative to losing the order entirely).
    * Returns the raw HttpClient response.
    */
-  async authedGet(path, { retried = false, retriedTimeout = false } = {}) {
+  async authedGet(path, { retried = false, retriedTimeout = false, timeoutMs } = {}) {
+    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout, timeoutMs }));
+  }
+
+  async _authedGet(path, { retried = false, retriedTimeout = false, timeoutMs } = {}) {
     if (!this.authenticated) await this.login();
     let res;
     try {
-      res = await this.http.get(this.url(path), { followRedirects: true });
+      res = await this.http.get(this.url(path), { followRedirects: true, timeoutMs });
     } catch (e) {
       if (!retriedTimeout && /timeout/i.test(String(e?.message))) {
         this.log.warn('request timed out, retrying once', { path });
-        const r = await this.authedGet(path, { retried, retriedTimeout: true });
+        const r = await this._authedGet(path, { retried, retriedTimeout: true, timeoutMs });
         return { ...r, _reauthed: true };
       }
       throw e;
@@ -287,7 +320,7 @@ export class PortalSession {
       this.authenticated = false;
       await this.login();
       this.log.info('login successful — retrying request', { path });
-      const r = await this.authedGet(path, { retried: true, retriedTimeout });
+      const r = await this._authedGet(path, { retried: true, retriedTimeout, timeoutMs });
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     this._pageCache.set(path, { body: res.body, status: res.status, ts: Date.now() });
@@ -298,11 +331,16 @@ export class PortalSession {
    *  same body — the caller is responsible for scraping fresh VIEWSTATE via a
    *  prior authedGet, so a bounce here means the session died between that GET
    *  and this POST, not that the tokens are stale). */
-  async authedPost(path, body, { retried = false, headers } = {}) {
+  async authedPost(path, body, { retried = false, headers, timeoutMs } = {}) {
+    return this._exclusive(() => this._authedPost(path, body, { retried, headers, timeoutMs }));
+  }
+
+  async _authedPost(path, body, { retried = false, headers, timeoutMs } = {}) {
     if (!this.authenticated) await this.login();
     const res = await this.http.post(this.url(path), formEncodeObj(body), {
       headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
       followRedirects: true,
+      timeoutMs,
     });
     this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
@@ -311,7 +349,7 @@ export class PortalSession {
       this.authenticated = false;
       await this.login();
       this.log.info('login successful — retrying request', { path });
-      const r = await this.authedPost(path, body, { retried: true, headers });
+      const r = await this._authedPost(path, body, { retried: true, headers, timeoutMs });
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     return res;

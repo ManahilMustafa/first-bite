@@ -98,6 +98,40 @@ test('portal postback accepts via VIEWSTATE replay', async () => {
   s.close();
 });
 
+test('portal two-step: list Accept then confirmation-page Accept', async () => {
+  // Real E-Street: New Orders tick opens the same details page as the email
+  // Accept Order link; only the second Accept assigns the order.
+  portal.addOrder('266-03350', { address: '221 N ORR AVE BENSON AZ 85602' });
+  portal.portalAcceptMode = 'two_step';
+  const s = session();
+  const r = await acceptViaPortal({ session: s, orderId: '266-03350' });
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome, 'accepted');
+  assert.deepEqual(r.steps, ['list_postback', 'details_postback']);
+  assert.equal(portal.orderStatus('266-03350'), 'accepted');
+  assert.ok(
+    portal.acceptAttempts.some((a) => /two_step/.test(a.via) && a.won),
+    'order must be won on the confirmation-page post, not the list click'
+  );
+  s.close();
+});
+
+test('portal two-step: list Accept alone does not assign the order', async () => {
+  portal.addOrder('266-03351');
+  portal.portalAcceptMode = 'two_step';
+  const s = session();
+  await s.login();
+  // Manually do only the list click (no details Accept).
+  const page = await s.authedGet('/AppraiserDashboard.aspx');
+  const { locateAcceptForOrder } = await import('../src/accept/portalAccept.js');
+  const { buildControlClick } = await import('../src/portal/aspnet.js');
+  const pb = locateAcceptForOrder(page.body, '266-03351');
+  assert.ok(pb);
+  await s.authedPost('/AppraiserDashboard.aspx', buildControlClick(page.body, pb));
+  assert.equal(portal.orderStatus('266-03351'), 'available', 'confirmation Accept not clicked yet');
+  s.close();
+});
+
 test('portal postback reports taken when order is taken mid-flight (race)', async () => {
   portal.addOrder('266-03335');
   const s = session();
@@ -268,6 +302,98 @@ test('executor does NOT invent accepted when every path missed and verify is wro
   assert.equal(r.accepted, false, 'must not claim a win when no path clicked Accept');
   assert.notEqual(r.via, 'verified');
   assert.equal(portal.orderStatus('266-03335'), 'available');
+  s.close();
+});
+
+test('executor does NOT claim accept when verify still shows available', async () => {
+  // Reproduces 2026-07-24 order 267-25294 class: path claimed win, portal still available.
+  portal.addOrder('266-03337');
+  const s = session();
+  const r = await executeAccept({
+    orderId: '266-03337',
+    session: s,
+    verify: async () => 'available',
+  });
+  assert.equal(r.accepted, false, 'must not claim win when portal still shows available');
+  assert.equal(r.outcome, 'still_available');
+  s.close();
+});
+
+test('executor does NOT claim accept on optimistic submitted + verify unknown', async () => {
+  portal.addOrder('266-03338');
+  const s = session();
+  const r = await executeAccept({
+    orderId: '266-03338',
+    session: s,
+    portalAcceptFn: async () => ({ ok: true, outcome: 'submitted', status: 200 }),
+    verify: async () => 'unknown',
+  });
+  assert.equal(r.accepted, false, 'soft 2xx without verify must not become accepted');
+  assert.equal(r.outcome, 'unverified');
+  assert.equal(portal.orderStatus('266-03338'), 'available');
+  s.close();
+});
+
+test('executor does NOT mark dashboard Accepted when verify is unknown', async () => {
+  // Even a path that saw success-looking HTML must not set accepted:true unless
+  // the portal verifier corroborates — otherwise Orders page can lie.
+  portal.addOrder('266-03339');
+  const s = session();
+  const r = await executeAccept({
+    orderId: '266-03339',
+    session: s,
+    portalAcceptFn: async () => ({
+      ok: true,
+      outcome: 'accepted',
+      status: 200,
+      steps: ['list_postback', 'details_postback'],
+    }),
+    verify: async () => 'unknown',
+  });
+  assert.equal(r.accepted, false);
+  assert.equal(r.outcome, 'unverified');
+  s.close();
+});
+
+test('executor marks Accepted only when portal verify confirms', async () => {
+  portal.addOrder('266-03341');
+  const s = session();
+  const r = await executeAccept({
+    orderId: '266-03341',
+    session: s,
+    verify: makePortalVerifier(s),
+  });
+  assert.equal(r.accepted, true);
+  assert.equal(r.verified, 'accepted');
+  assert.equal(portal.orderStatus('266-03341'), 'accepted');
+  s.close();
+});
+
+test('portalAccept does not treat bare 200 with nav chrome as accepted', async () => {
+  portal.addOrder('266-03340');
+  const s = session();
+  await s.login();
+  const navPage = `<html><body>
+    <a id="ctl00_cphBody_lnkCondAcceptedOrders">Conditionally Accepted Orders</a>
+    <a id="ctl00_cphBody_lnkShowInProgressOrders">In Progress Orders</a>
+    <div>Order 266-03340 221 N ORR AVE</div>
+    <input type="hidden" name="__VIEWSTATE" value="x" />
+  </body></html>`;
+  const stubSession = {
+    ...s,
+    routes: { ...s.routes, newOrders: '/AppraiserDashboard.aspx' },
+    lastPage: null,
+    authedGet: async () => ({
+      status: 200,
+      body: `${navPage}
+        <input type="image" name="ctl00$cphBody$grdNewOrders$ctl02$imgBtnBroadcastAccept$266-03340"
+               title="Click here to accept this order" src="x.png" />`,
+    }),
+    authedPost: async () => ({ status: 200, body: navPage, durationMs: 1 }),
+  };
+  const r = await acceptViaPortal({ session: stubSession, orderId: '266-03340' });
+  assert.equal(r.ok, false, 'nav chrome + HTTP 200 must not count as accepted');
+  assert.equal(r.outcome, 'unknown');
   s.close();
 });
 

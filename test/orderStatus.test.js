@@ -75,6 +75,23 @@ test('a FRESH unverified decline stays Pending; a STALE one reclassifies to Fail
   assert.equal(staleResult.status, STATUS.FAILED);
 });
 
+test('a FRESH unverified accept stays Pending (not Accepted); STALE → Failed', () => {
+  const events = [ev({ action: 'accept', outcome: 'unverified', accepted: false })];
+  const freshResult = computeFinalStatus(events, FRESH_NOW);
+  assert.equal(freshResult.status, STATUS.PENDING);
+  assert.match(freshResult.reason, /confirm/i);
+  assert.notEqual(freshResult.status, STATUS.ACCEPTED);
+  const staleResult = computeFinalStatus(events, STALE_NOW);
+  assert.equal(staleResult.status, STATUS.FAILED);
+});
+
+test('still_available maps to Failed — never Accepted', () => {
+  const events = [ev({ action: 'accept', outcome: 'still_available', accepted: false })];
+  const { status, reason } = computeFinalStatus(events);
+  assert.equal(status, STATUS.FAILED);
+  assert.match(reason, /available/i);
+});
+
 test('taken-by-another-vendor maps to Failed with a plain reason', () => {
   const events = [ev({ outcome: 'taken', accepted: false })];
   const { status, reason } = computeFinalStatus(events);

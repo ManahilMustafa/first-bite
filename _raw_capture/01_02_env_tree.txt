@@ -1,0 +1,235 @@
+=== 1. Environment / config ===
+/root/Estreet
+73966be46272797cd3a388504522820b844d6bf8
+73966be Restore portal detectionLatencyMs after merging poller safety.
+2e0fa2d .
+2b98890 Ship Estreet bot with admin dashboard, OTP inbox, and accept fixes.
+856b6e1 hello hello
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .env.example
+	modified:   src/accept/acceptExecutor.js
+	modified:   src/accept/declineExecutor.js
+	modified:   src/accept/emailAccept.js
+	modified:   src/accept/portalAccept.js
+	modified:   src/accept/portalDecline.js
+	modified:   src/accept/verifier.js
+	modified:   src/detect/portalPoller.js
+	modified:   src/index.js
+	modified:   src/portal/aspnet.js
+	modified:   src/portal/session.js
+	modified:   src/util/httpClient.js
+	modified:   src/util/orderStatus.js
+	modified:   src/worker/worker.js
+	modified:   test/accept.test.js
+	modified:   test/decline.test.js
+	modified:   test/mocks/mockPortal.js
+	modified:   test/orderStatus.test.js
+	modified:   test/portalPollerSafety.test.js
+	modified:   test/unit.test.js
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	_raw_capture/
+	scripts/probe-signalr.mjs
+	src/accept/diagnostic.js
+	src/accept/signals.js
+	src/detect/signalrProbe.js
+	test/signals.test.js
+
+no changes added to commit (use "git add" and/or "git commit -a")
+# E-Street Bot — local development config (do NOT commit)
+
+CREDS_ENCRYPTION_KEY=<redacted>
+
+ACCOUNTS_STORE=<redacted>
+GMAIL_CONNECTION_STORE=<redacted>
+
+LOCK_BACKEND=<redacted>
+REDIS_URL=<redacted>
+
+CONTROL_PLANE_PORT=<redacted>
+CONTROL_PLANE_TOKEN=<redacted>
+
+PORTAL_POLL_INTERVAL_MS=<redacted>
+ORDER_LOCK_TTL_MS=<redacted>
+GMAIL_POLL_INTERVAL_MS=<redacted>
+LOG_LEVEL=<redacted>
+
+GOOGLE_OAUTH_CLIENT_ID=<redacted>
+GOOGLE_OAUTH_CLIENT_SECRET=<redacted>
+# Browser opens OAuth on your PC; Google must redirect back to THIS VPS (not localhost).
+GOOGLE_OAUTH_REDIRECT_URI=<redacted>
+GMAIL_PUBSUB_TOPIC=<redacted>
+GMAIL_PUBSUB_VERIFICATION_TOKEN=<redacted>
+
+# Central inbox creds (bootstraps the connection without OAuth)
+GMAIL_ADDRESS=<redacted>
+GMAIL_REFRESH_TOKEN=<redacted>
+PORTAL_POLL_FLOOR_MS=<redacted>
+GMAIL_POLL_FLOOR_MS=<redacted>
+REUSE_CACHED_PAGE=<redacted>
+v22.23.1
+{
+  "name": "firstbite",
+  "version": "1.0.0",
+  "description": "FirstBite — multi-account auto-accept bot for E-Street / ValueLink AMS appraisal orders",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "control-plane": "node src/controlPlane/server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "test:watch": "node --test --watch \"test/*.test.js\"",
+    "latency-report": "node scripts/latency-report.mjs"
+  },
+  "keywords": [
+    "estreet",
+    "valuelink",
+    "appraisal",
+    "automation"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
+  "optionalDependencies": {
+    "redis": "^4.7.0"
+  }
+}
+=== 2. Full source tree ===
+src/accept/acceptExecutor.js
+src/accept/declineExecutor.js
+src/accept/diagnostic.js
+src/accept/emailAccept.js
+src/accept/emailDecline.js
+src/accept/portalAccept.js
+src/accept/portalDecline.js
+src/accept/race.js
+src/accept/signals.js
+src/accept/verifier.js
+src/controlPlane/server.js
+src/detect/attribution.js
+src/detect/emailParser.js
+src/detect/gmailWatcher.js
+src/detect/portalPoller.js
+src/detect/signalrProbe.js
+src/gmail/connect.js
+src/gmail/oauth.js
+src/index.js
+src/lock/lock.js
+src/lock/memoryLock.js
+src/lock/redisLock.js
+src/orchestrator/orchestrator.js
+src/portal/aspnet.js
+src/portal/emailOtp.js
+src/portal/session.js
+src/store/accountsStore.js
+src/store/gmailConnection.js
+src/store/orderEventsStore.js
+src/store/sessionCookieStore.js
+src/util/crypto.js
+src/util/httpClient.js
+src/util/latencyReport.js
+src/util/logger.js
+src/util/orderStatus.js
+src/util/orderTimeline.js
+src/util/regionFilter.js
+src/worker/worker.js
+data/login-result.html
+data/accept-diagnostic/1785614184934_268-01471_portal_post_accept_taken.html
+data/accept-diagnostic/1785081720779_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785611299209_268-03057_portal_post_accept_taken.html
+data/accept-diagnostic/1785612099353_268-01342_portal_post_accept_taken.html
+data/accept-diagnostic/1785611131153_268-03025_portal_confirm_page.html
+data/accept-diagnostic/1785611680728_268-03140_portal_post_accept_taken.html
+data/accept-diagnostic/1785612095244_268-01342_portal_confirm_page.html
+data/accept-diagnostic/1785081733667_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785610752377_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785163626694_267-35868_portal_confirm_page.html
+data/accept-diagnostic/1785340172381_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785613957504_268-03514_portal_post_accept_taken.html
+data/accept-diagnostic/1785169634215_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785612764572_268-03220_portal_post_accept_taken.html
+data/accept-diagnostic/1785677528640_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785081938035_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785611779921_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785611779902_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785169634238_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785612762894_268-03220_portal_confirm_page.html
+data/accept-diagnostic/1785081726479_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785612384513_268-01414_portal_confirm_page.html
+data/accept-diagnostic/1785615104701_268-03632_portal_confirm_page.html
+data/accept-diagnostic/1785338576885_267-36466_portal_confirm_page.html
+data/accept-diagnostic/1785611555935_268-03110_portal_confirm_page.html
+data/accept-diagnostic/1785615105369_268-03632_portal_post_accept_taken.html
+data/accept-diagnostic/1785339193426_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785612414661_268-01424_portal_confirm_page.html
+data/accept-diagnostic/1785614973623_268-03601_portal_confirm_page.html
+data/accept-diagnostic/1785600514140_268-00179_portal_post_accept_taken.html
+data/accept-diagnostic/1785616461039_268-01967_portal_confirm_page.html
+data/accept-diagnostic/1785338619634_267-36476_portal_confirm_page.html
+data/accept-diagnostic/1785616448404_268-01963_portal_confirm_page.html
+data/accept-diagnostic/1785677528619_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785600514042_268-00179_portal_confirm_page.html
+data/accept-diagnostic/1785613866141_268-03491_portal_confirm_page.html
+data/accept-diagnostic/1785081961352_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785613749953_268-03459_portal_confirm_page.html
+data/accept-diagnostic/1785081938017_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785340172401_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785614975617_268-03602_portal_confirm_page.html
+data/accept-diagnostic/1785163661377_267-35875_portal_confirm_page.html
+data/accept-diagnostic/1785611362636_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785610752352_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785611763172_268-03160_portal_confirm_page.html
+data/accept-diagnostic/1785611136140_268-03025_portal_post_accept_taken.html
+data/accept-diagnostic/1785613870870_268-03491_portal_post_accept_taken.html
+data/accept-diagnostic/1785081726462_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785081961319_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785081733683_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785169643307_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785163631695_267-35868_portal_post_accept.html
+data/accept-diagnostic/1785614180656_268-01471_portal_confirm_page.html
+data/accept-diagnostic/1785612385643_268-01414_portal_post_accept_taken.html
+data/accept-diagnostic/1785677505382_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785611718403_268-03149_portal_confirm_page.html
+data/accept-diagnostic/1785612023161_268-01323_portal_post_accept_taken.html
+data/accept-diagnostic/1785612416325_268-01424_portal_post_accept_taken.html
+data/accept-diagnostic/1785677505414_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785613753909_268-03459_portal_post_accept_taken.html
+data/accept-diagnostic/1785616455666_268-01963_portal_post_accept_taken.html
+data/accept-diagnostic/1785612181164_268-01363_portal_post_accept_taken.html
+data/accept-diagnostic/1785339193444_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785611767473_268-03160_portal_post_accept_taken.html
+data/accept-diagnostic/1785614979436_268-03602_portal_post_accept_taken.html
+data/accept-diagnostic/1785612019964_268-01323_portal_confirm_page.html
+data/accept-diagnostic/1785611561572_268-03110_portal_post_accept_taken.html
+data/accept-diagnostic/1785612174772_268-01363_portal_confirm_page.html
+data/accept-diagnostic/1785611294218_268-03057_portal_confirm_page.html
+data/accept-diagnostic/1785163665532_267-35875_portal_post_accept.html
+data/accept-diagnostic/1785611675396_268-03140_portal_confirm_page.html
+data/accept-diagnostic/1785611723627_268-03149_portal_post_accept_taken.html
+data/accept-diagnostic/1785169643325_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785081720743_266-03335_email_confirm_page.html
+data/accept-diagnostic/1785614980350_268-03601_portal_post_accept_taken.html
+data/accept-diagnostic/1785613951395_268-03514_portal_confirm_page.html
+data/accept-diagnostic/1785616463405_268-01967_portal_post_accept_taken.html
+data/accept-diagnostic/1785611362653_266-03350_portal_confirm_page.html
+data/accept-diagnostic/1785338582319_267-36466_portal_post_accept_error.html
+data/login-after-otp.html
+data/dashboard-diagnostic.html
+data/orders.log.jsonl
+data/signalr-probe/summary.json
+data/signalr-probe/_signalr_negotiate_negotiateVersion_1.txt
+data/signalr-probe/dashboard.html
+data/signalr-probe/_signalr_negotiate_clientProtocol_2.1.txt
+data/signalr-probe/_signalr_hubs.txt
+data/gmail.enc.json
+data/orders.log.jsonl.bak-20260725T045147Z
+data/accounts.enc.json
+data/login-fail.html
+data/login-page.html
+data/sessions.enc.json

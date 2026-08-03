@@ -63,6 +63,18 @@ test('decline link gives up after exactly one retry when the bounce never clears
   s.close();
 });
 
+test('portal two-step: list Decline then confirmation-page Decline', async () => {
+  portal.addOrder('266-05010');
+  portal.portalDeclineMode = 'two_step';
+  const s = session();
+  const r = await declineViaPortal({ session: s, orderId: '266-05010' });
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome, 'declined');
+  assert.deepEqual(r.steps, ['list_postback', 'details_postback']);
+  assert.equal(portal.orderStatus('266-05010'), 'declined');
+  s.close();
+});
+
 // ── Decline Path B, opt-in: reuse the poller's cached page ─────────────────--
 test('reuseCachedPage (decline): a fresh cached page is used directly, skipping the extra GET', async () => {
   portal.addOrder('266-05000');

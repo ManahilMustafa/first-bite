@@ -10,6 +10,8 @@ import {
   findPostbackTarget,
   looksLikeLogin,
   looksLikeStaleState,
+  scrapeFormAction,
+  scrapeFormActionForControl,
 } from '../src/portal/aspnet.js';
 
 const KEY = resolveKey(Buffer.alloc(32, 7).toString('base64'));
@@ -136,6 +138,21 @@ test('buildPostback assembles state + event fields', () => {
   assert.equal(body.__EVENTTARGET, 'ctl00$gv$btnAccept');
   assert.equal(body.__EVENTARGUMENT, '266-03335');
   assert.equal(body.__VIEWSTATE, 'VS&1');
+});
+
+test('scrapeFormAction decodes &amp; in action (real AcceptBroadcastAppraisal)', () => {
+  const html = `<form method="post" action="./AcceptBroadcastAppraisal.aspx?ApprID=252821&amp;Accept=asis">
+    <input type="submit" name="ctl00$cphBody$btnSubmit" value="Accept Appraisal" />
+  </form>`;
+  const base = 'https://estreetamc.spurams.com/AcceptBroadcastAppraisal.aspx?ApprID=252821&Accept=asis';
+  const url = scrapeFormAction(html, base);
+  assert.equal(
+    url,
+    'https://estreetamc.spurams.com/AcceptBroadcastAppraisal.aspx?ApprID=252821&Accept=asis'
+  );
+  assert.doesNotMatch(url, /&amp;/);
+  const byControl = scrapeFormActionForControl(html, base, 'ctl00$cphBody$btnSubmit');
+  assert.equal(byControl, url);
 });
 
 test('looksLikeLogin detects a login page', () => {

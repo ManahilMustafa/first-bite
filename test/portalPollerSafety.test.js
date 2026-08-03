@@ -120,6 +120,35 @@ describe('PortalPoller backoff + circuit', () => {
     poller.stop();
   });
 
+  test('hold that overlaps a timer does not kill the poll loop', async () => {
+    let calls = 0;
+    const session = {
+      username: 'u',
+      routes: { newOrders: '/Orders/NewOrders.aspx' },
+      authedGet: async () => {
+        calls++;
+        return { status: 200, body: '' };
+      },
+    };
+    const poller = new PortalPoller({
+      session,
+      onOrder: () => {},
+      intervalMs: 30,
+      minIntervalMs: 0,
+      circuitThreshold: 99,
+      cooldownMs: 60_000,
+    });
+    poller.start();
+    await waitFor(() => calls >= 1, 2000);
+    poller.hold('accept');
+    // Let at least one scheduled tick fire while held (old bug: returned without reschedule).
+    await sleep(80);
+    const callsWhileHeld = calls;
+    poller.release('accept');
+    await waitFor(() => calls > callsWhileHeld, 2000);
+    poller.stop();
+  });
+
   test('cooldown probe restarts polling after pause', async () => {
     let failCount = 0;
     const session = {

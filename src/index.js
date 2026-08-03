@@ -172,6 +172,22 @@ export async function main() {
 
   await orchestrator.sync();
 
+  // Discover whether SignalR can replace/augment portal polling (unknown #2).
+  // Non-blocking for boot: failures only log; poller stays primary until wired.
+  try {
+    const { probeSignalR } = await import('./detect/signalrProbe.js');
+    const anyWorker = [...orchestrator.workers.values()][0];
+    if (anyWorker?.session) {
+      probeSignalR(anyWorker.session, log.child('signalr-probe')).catch((e) =>
+        log.warn('signalr probe failed', { err: String(e) })
+      );
+    } else {
+      log.info('signalr probe skipped — no live worker session yet');
+    }
+  } catch (e) {
+    log.warn('signalr probe import failed', { err: String(e) });
+  }
+
   const server = createControlPlane({ store, orchestrator, gmailWatcher, connectionStore, eventsStore });
   const port = Number(process.env.CONTROL_PLANE_PORT) || 8787;
   server.listen(port, () => log.info('control plane listening', { port }));
@@ -206,9 +222,9 @@ export async function main() {
   // Gmail poll loop — fetches new forwarded orders from the central inbox on a
   // timer. This is the detection path when there's no Pub/Sub push (no public
   // webhook). No-ops until the inbox is connected; overlap-guarded.
-  // Gmail API quota + the inherent seconds-latency of email/forwarding make
-  // sub-second polling pointless and rate-limit-prone — floor it.
-  const GMAIL_POLL_FLOOR_MS = 1000;
+  // Gmail API quota + email/forwarding latency: allow 500ms floor for FCFS
+  // races; override with GMAIL_POLL_FLOOR_MS if needed.
+  const GMAIL_POLL_FLOOR_MS = Number(process.env.GMAIL_POLL_FLOOR_MS) || 500;
   let gmailPollMs = Number(process.env.GMAIL_POLL_INTERVAL_MS) || 15000;
   if (gmailPollMs < GMAIL_POLL_FLOOR_MS) {
     log.warn('GMAIL_POLL_INTERVAL_MS below safe floor — clamping', {

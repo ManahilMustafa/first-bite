@@ -1,0 +1,1885 @@
+===CAT_portalPoller===
+// Portal poller — the reliable, bounded detector.
+//
+// Polls the authenticated New Orders page every N ms and emits any order id it
+// hasn't seen before. Email/push can be delayed; the portal is the source of
+// truth, so this guarantees detection within one poll interval regardless of
+// email behaviour. Tighter interval = lower latency but higher ban risk.
+//
+// On 403/429/timeout: exponential backoff. After N consecutive block signals,
+// open a circuit — pause portal polling (Gmail detection still runs) until
+// cooldown expires or resume() is called.
+import { logger } from '../util/logger.js';
+import { parseAddressMeta } from '../util/regionFilter.js';
+import { PortalHttpError } from '../portal/session.js';
+
+const ORDER_ID_RE = /\b(\d{2,4}-\d{4,6})\b/g; // e.g. 266-03335
+
+const DEFAULT_INTERVAL_MS = 10000;
+const BACKOFF_CAP_MS = 5 * 60 * 1000;
+
+function resolveFloorMs() {
+  if (process.env.PORTAL_POLL_FLOOR_MS === undefined || process.env.PORTAL_POLL_FLOOR_MS === '') {
+    return 5000;
+  }
+  return Number(process.env.PORTAL_POLL_FLOOR_MS);
+}
+
+function resolveCircuitThreshold() {
+  const n = Number(process.env.PORTAL_CIRCUIT_THRESHOLD);
+  return Number.isFinite(n) && n > 0 ? n : 5;
+}
+
+function resolveCooldownMs() {
+  const n = Number(process.env.PORTAL_CIRCUIT_COOLDOWN_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000;
+}
+
+/** @param {unknown} err */
+export function isBlockSignal(err) {
+  if (err instanceof PortalHttpError && err.isThrottle) return true;
+  if (err && typeof err === 'object' && 'status' in err) {
+    const s = /** @type {{status?:number}} */ (err).status;
+    if (s === 403 || s === 429) return true;
+  }
+  const code = err && typeof err === 'object' && 'code' in err ? String(/** @type {{code?:string}} */ (err).code) : '';
+  if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|ABORT/i.test(code)) return true;
+  const msg = String(err?.message || err || '');
+  if (/Portal HTTP (403|429)|status (403|429)|ETIMEDOUT|ECONNRESET|timeout/i.test(msg)) return true;
+  return false;
+}
+
+export class PortalPoller {
+  /**
+   * @param {object} opts
+   * @param {import('../portal/session.js').PortalSession} opts.session
+   * @param {(order:{orderId:string, source:'portal'})=>void} opts.onOrder
+   * @param {number} [opts.intervalMs]
+   * @param {number} [opts.minIntervalMs] override floor (tests: 0)
+   * @param {number} [opts.circuitThreshold]
+   * @param {number} [opts.cooldownMs]
+   * @param {(html:string)=>string[]} [opts.parseOrders] custom order-id extractor
+   * @param {string} [opts.newOrdersPath]
+   */
+  constructor({
+    session,
+    onOrder,
+    intervalMs,
+    minIntervalMs,
+    circuitThreshold,
+    cooldownMs,
+    parseOrders,
+    newOrdersPath,
+    log,
+  }) {
+    this.session = session;
+    this.onOrder = onOrder;
+
+    const floor =
+      minIntervalMs !== undefined && minIntervalMs !== null
+        ? Number(minIntervalMs)
+        : resolveFloorMs();
+    let requested =
+      intervalMs ?? (Number(process.env.PORTAL_POLL_INTERVAL_MS) || DEFAULT_INTERVAL_MS);
+    if (!Number.isFinite(requested) || requested <= 0) requested = DEFAULT_INTERVAL_MS;
+    if (floor > 0 && requested < floor) {
+      (log || logger)('poller').warn('poll interval below floor — clamping', {
+        requested,
+        floor,
+      });
+      requested = floor;
+    }
+    this.intervalMs = requested;
+    this.circuitThreshold = circuitThreshold ?? resolveCircuitThreshold();
+    this.cooldownMs = cooldownMs ?? resolveCooldownMs();
+
+    this.parseOrders = parseOrders || defaultParseOrders;
+    this.newOrdersPath = newOrdersPath || session.routes.newOrders;
+    this.log = (log || logger)(`poller:${session.username}`);
+    this.seen = new Set();
+    this._timer = null;
+    this._cooldownTimer = null;
+    this._running = false;
+    this._stopped = false;
+    this._lastPollAt = null;
+    this.paused = false;
+    this.pauseReason = null;
+    this.pausedAt = null;
+    this.consecutiveBlockErrors = 0;
+    this.backoffLevel = 0;
+    this.currentBackoffMs = this.intervalMs;
+    this._holds = 0;
+    this.stats = {
+      polls: 0,
+      errors: 0,
+      blockSignals: 0,
+      circuitOpens: 0,
+      detected: 0,
+      lastPollMs: 0,
+    };
+  }
+
+  /** Mark the current orders as already-seen without emitting (baseline). */
+  async primeBaseline() {
+    try {
+      const page = await this.session.authedGet(this.newOrdersPath);
+      for (const id of this.parseOrders(page.body)) this.seen.add(id);
+      this.log.info('baseline primed', { count: this.seen.size });
+    } catch (e) {
+      this.log.warn('baseline prime failed', { err: String(e) });
+    }
+  }
+
+  start() {
+    if (this._stopped) return;
+    if (this.paused) return;
+    if (this._timer) return;
+    this.log.info('poller started', { intervalMs: this.intervalMs });
+    this._schedule(0);
+  }
+
+  /** Pause ticks while accept/decline owns the portal session (not a circuit). */
+  hold(reason = 'hold') {
+    this._holds = (this._holds || 0) + 1;
+    this.log.debug?.('poller hold', { reason, holds: this._holds });
+  }
+
+  release(reason = 'hold') {
+    this._holds = Math.max(0, (this._holds || 0) - 1);
+    this.log.debug?.('poller release', { reason, holds: this._holds });
+    // A tick may have been skipped while held; resume immediately so we don't
+    // sit blind until the next unrelated schedule (or forever if the timer
+    // already fired during the hold — see _tick early-return).
+    if (this._holds === 0 && !this._stopped && !this.paused && !this._running) {
+      this._schedule(0);
+    }
+  }
+
+  stop() {
+    this._stopped = true;
+    this._clearTimers();
+  }
+
+  /**
+   * Clear the circuit breaker and resume polling at the base interval.
+   * Used by the control-plane resume endpoint and after cooldown probe success.
+   */
+  resume() {
+    this._clearCooldownTimer();
+    this.paused = false;
+    this.pauseReason = null;
+    this.pausedAt = null;
+    this.consecutiveBlockErrors = 0;
+    this.backoffLevel = 0;
+    this.currentBackoffMs = this.intervalMs;
+    this._stopped = false;
+    this._clearPollTimer();
+    this.log.info('poller resumed');
+    this._schedule(0);
+  }
+
+  /** Snapshot for orchestrator.status() / dashboard. */
+  statusSnapshot() {
+    return {
+      paused: this.paused,
+      pauseReason: this.pauseReason,
+      pausedAt: this.pausedAt,
+      backoffMs: this.currentBackoffMs,
+      consecutiveBlockErrors: this.consecutiveBlockErrors,
+      intervalMs: this.intervalMs,
+      stats: { ...this.stats },
+    };
+  }
+
+  _schedule(delayMs) {
+    if (this._stopped || this.paused) return;
+    this._clearPollTimer();
+    this.currentBackoffMs = delayMs;
+    this._timer = setTimeout(() => {
+      this._timer = null;
+      this._tick();
+    }, delayMs);
+    this._timer.unref?.();
+  }
+
+  _clearPollTimer() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+  }
+
+  _clearCooldownTimer() {
+    if (this._cooldownTimer) {
+      clearTimeout(this._cooldownTimer);
+      this._cooldownTimer = null;
+    }
+  }
+
+  _clearTimers() {
+    this._clearPollTimer();
+    this._clearCooldownTimer();
+  }
+
+  async _tick() {
+    if (this._stopped || this.paused) return;
+    // Never drop the poll loop: a timer that fires while a tick is in-flight
+    // or the session is held used to return without rescheduling, which left
+    // the poller dead until process restart (missed New Orders entirely).
+    if (this._running || this._holds > 0) {
+      this._schedule(this._holds > 0 ? Math.min(50, this.intervalMs) : this.intervalMs);
+      return;
+    }
+    this._running = true;
+    // Bound for portal detection latency: order wasn't present as of the last
+    // successful poll start. First tick has no anchor (null is honest).
+    const previousPollAt = this._lastPollAt;
+    this._lastPollAt = Date.now();
+    const t0 = process.hrtime.bigint();
+    try {
+      const page = await this.session.authedGet(this.newOrdersPath);
+      const ids = this.parseOrders(page.body);
+      for (const id of ids) {
+        if (!this.seen.has(id)) {
+          this.seen.add(id);
+          this.stats.detected++;
+          this.log.info('NEW order detected', { orderId: id });
+          try {
+            const address = extractAddressNearOrder(page.body, id);
+            const meta = parseAddressMeta(address || '');
+            this.onOrder({
+              orderId: id,
+              source: 'portal',
+              address,
+              zip: meta.zip,
+              state: meta.state,
+              previousPollAt,
+            });
+          } catch (e) {
+            this.log.error('onOrder handler threw', { err: String(e) });
+          }
+        }
+      }
+      this.stats.polls++;
+      this.consecutiveBlockErrors = 0;
+      this.backoffLevel = 0;
+      this.currentBackoffMs = this.intervalMs;
+      this._schedule(this.intervalMs);
+    } catch (e) {
+      this.stats.errors++;
+      if (isBlockSignal(e)) {
+        this.stats.blockSignals++;
+        this.consecutiveBlockErrors++;
+        this.backoffLevel++;
+        const delay = Math.min(this.intervalMs * 2 ** (this.backoffLevel - 1), BACKOFF_CAP_MS);
+        this.currentBackoffMs = delay;
+        this.log.warn('poll block/throttle signal', {
+          err: String(e),
+          consecutive: this.consecutiveBlockErrors,
+          nextDelayMs: delay,
+        });
+        if (this.consecutiveBlockErrors >= this.circuitThreshold) {
+          this._openCircuit(String(e?.message || e));
+        } else {
+          this._schedule(delay);
+        }
+      } else {
+        this.log.warn('poll error', { err: String(e) });
+        this._schedule(this.intervalMs);
+      }
+    } finally {
+      this.stats.lastPollMs = Number(process.hrtime.bigint() - t0) / 1e6;
+      this._running = false;
+    }
+  }
+
+  _openCircuit(reason) {
+    this.stats.circuitOpens++;
+    this.paused = true;
+    this.pauseReason = reason || 'circuit_open';
+    this.pausedAt = new Date().toISOString();
+    this._clearPollTimer();
+    this.log.warn('portal poller circuit OPEN — pausing portal polls (Gmail still active)', {
+      reason: this.pauseReason,
+      cooldownMs: this.cooldownMs,
+      threshold: this.circuitThreshold,
+    });
+    if (this.cooldownMs > 0) {
+      this._cooldownTimer = setTimeout(() => this._cooldownProbe(), this.cooldownMs);
+      this._cooldownTimer.unref?.();
+    }
+  }
+
+  async _cooldownProbe() {
+    this._cooldownTimer = null;
+    if (this._stopped) return;
+    this.log.info('circuit cooldown elapsed — probing portal');
+    this.paused = false;
+    this.pauseReason = null;
+    this.pausedAt = null;
+    this.consecutiveBlockErrors = 0;
+    this.backoffLevel = 0;
+    // One immediate tick; on block signal it will count toward a fresh circuit.
+    this._schedule(0);
+  }
+}
+
+/** Pull a property address from HTML near an order id (for region filtering). */
+export function extractAddressNearOrder(html, orderId) {
+  const idx = html.indexOf(orderId);
+  if (idx === -1) return undefined;
+  const window = html
+    .slice(Math.max(0, idx - 800), idx + 800)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const m = window.match(/([0-9][0-9A-Za-z .,'/-]{8,90}\b[A-Z]{2}\s+\d{5}\b)/);
+  return m ? m[1].trim() : undefined;
+}
+
+/** Default: pull order-number tokens (e.g. 266-03335) out of the page text. */
+export function defaultParseOrders(html) {
+  const ids = new Set();
+  let m;
+  ORDER_ID_RE.lastIndex = 0;
+  while ((m = ORDER_ID_RE.exec(html))) ids.add(m[1]);
+  return [...ids];
+}
+
+export default PortalPoller;
+===CAT_gmailWatcher===
+// Gmail detector — ONE central inbox that every user forwards their orders into.
+//
+// Architecture (single-mailbox, multi-user):
+//   - ONE GCP project / Pub/Sub topic / subscription / webhook.
+//   - ONE operator OAuth refresh token + ONE users.watch() (renew daily; the
+//     watch expires after 7 days) + ONE historyId cursor.
+//   - A Pub/Sub push hits the webhook with { emailAddress, historyId } for the
+//     central inbox. We call history.list from the stored cursor, fetch new
+//     messages, parse order emails, ATTRIBUTE each to the user it was forwarded
+//     from (via the forwarding headers), and emit the order to that user.
+//
+// Email delivery + forwarding + Pub/Sub tail latency are inherently seconds, so
+// this is a REDUNDANCY detector that also supplies the email's self-contained
+// ACCEPT/DECLINE links; the per-user portal poller is the fast path.
+import { parseOrderEmail } from './emailParser.js';
+import { extractRecipientCandidates } from './attribution.js';
+import { orderMatchesRegion } from '../util/regionFilter.js';
+import { logger } from '../util/logger.js';
+
+const GMAIL_API = 'https://gmail.googleapis.com/gmail/v1';
+const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+
+/** Decode the base64-encoded Pub/Sub push envelope into { emailAddress, historyId }. */
+export function decodePubSubPush(reqBody) {
+  const data = reqBody?.message?.data;
+  if (!data) throw new Error('Pub/Sub push missing message.data');
+  const json = Buffer.from(data, 'base64').toString('utf8');
+  const parsed = JSON.parse(json);
+  return {
+    emailAddress: parsed.emailAddress,
+    historyId: String(parsed.historyId),
+    messageId: reqBody.message.messageId,
+    publishTime: reqBody.message.publishTime,
+  };
+}
+
+/**
+ * Decode a Gmail message payload (base64url body parts) into
+ * { html, text, subject, headers, internalDate }. `headers` is the raw payload
+ * header array, needed for attribution (Delivered-To / X-Forwarded-For / etc).
+ * `internalDate` (epoch ms, Gmail's own receipt timestamp for the message) is
+ * the only honest anchor we have for "when did this order actually become
+ * available" — used to measure real detection latency, not a guess.
+ */
+export function decodeGmailMessage(message) {
+  const headers = message.payload?.headers || [];
+  const subject = headers.find((h) => h.name?.toLowerCase() === 'subject')?.value || '';
+  let html = '';
+  let text = '';
+  const walk = (part) => {
+    if (!part) return;
+    const mime = part.mimeType || '';
+    const body = part.body?.data;
+    if (body) {
+      const decoded = Buffer.from(body.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+      if (mime === 'text/html') html += decoded;
+      else if (mime === 'text/plain') text += decoded;
+    }
+    for (const p of part.parts || []) walk(p);
+  };
+  walk(message.payload);
+  const internalDate = message.internalDate ? Number(message.internalDate) : null;
+  return { html, text, subject, headers, internalDate };
+}
+
+export class GmailWatcher {
+  /**
+   * @param {object} opts
+   * @param {object} opts.oauth { clientId, clientSecret }
+   * @param {()=>Promise<string|null>} opts.getRefreshToken  central inbox refresh token
+   * @param {(address:string)=>(object|null|Promise<object|null>)} opts.resolveUser
+   *        return the account registered for a forwarding address, else null
+   * @param {()=>Promise<string|null>} opts.getHistoryId      central cursor getter
+   * @param {(historyId:string)=>Promise<void>} opts.saveHistoryId
+   * @param {(order:object)=>void} opts.onOrder
+   * @param {string[]} [opts.excludeAddresses]  never attribute to these (e.g. the central inbox)
+   * @param {typeof fetch} [opts.fetchImpl]  injectable for tests
+   */
+  constructor({
+    oauth,
+    getRefreshToken,
+    resolveUser,
+    getHistoryId,
+    saveHistoryId,
+    onOrder,
+    onUnattributed,
+    excludeAddresses = [],
+    fetchImpl = fetch,
+    log = logger,
+  }) {
+    this.oauth = oauth;
+    this.getRefreshToken = getRefreshToken;
+    this.resolveUser = resolveUser;
+    this.getHistoryId = getHistoryId;
+    this.saveHistoryId = saveHistoryId;
+    this.onOrder = onOrder;
+    this.onUnattributed = onUnattributed; // quarantined orders (no registered user)
+    this.excludeAddresses = excludeAddresses;
+    this.fetch = fetchImpl;
+    this.log = log('gmail');
+  }
+
+  async accessTokenFor(refreshToken) {
+    // Cache the access token until ~1 min before expiry. Without this, frequent
+    // polling would hit Google's token endpoint on every tick and get throttled.
+    const now = Date.now();
+    if (this._tok && this._tok.rt === refreshToken && this._tok.exp > now + 60000) {
+      return this._tok.at;
+    }
+    const res = await this.fetch(OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: this.oauth.clientId,
+        client_secret: this.oauth.clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      }),
+    });
+    if (!res.ok) throw new Error(`OAuth token refresh failed: ${res.status}`);
+    const j = await res.json();
+    this._tok = { at: j.access_token, rt: refreshToken, exp: now + (Number(j.expires_in) || 3600) * 1000 };
+    return j.access_token;
+  }
+
+  async api(accessToken, path) {
+    const res = await this.fetch(`${GMAIL_API}${path}`, {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error(`Gmail API ${path} -> ${res.status}`);
+    return res.json();
+  }
+
+  /** Fetch the authenticated Gmail address. */
+  async getProfile(accessToken) {
+    return this.api(accessToken, '/users/me/profile');
+  }
+
+  /** Register/renew the watch for the central inbox (call daily; expires in 7 days). */
+  async registerWatch(accessToken, topicName) {
+    const res = await this.fetch(`${GMAIL_API}/users/me/watch`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ topicName, labelIds: ['INBOX'], labelFilterAction: 'include' }),
+    });
+    if (!res.ok) throw new Error(`watch failed: ${res.status}`);
+    return res.json(); // { historyId, expiration }
+  }
+
+  /** Attribute a parsed message to a registered user via its forwarding headers. */
+  async _attribute(headers, centralAddress) {
+    const candidates = extractRecipientCandidates(headers, {
+      excludeAddresses: [...this.excludeAddresses, centralAddress].filter(Boolean),
+    });
+    for (const c of candidates) {
+      const account = await this.resolveUser(c.address);
+      if (account) return { account, address: c.address, via: c.via, candidates };
+    }
+    return { account: null, candidates };
+  }
+
+  /** Handle one Pub/Sub push: pull new messages since the cursor, attribute, emit. */
+  async handlePush(pushBody) {
+    const { emailAddress, historyId } = decodePubSubPush(pushBody);
+    const refreshToken = await this.getRefreshToken();
+    if (!refreshToken) {
+      this.log.warn('gmail push but central inbox not connected');
+      return { handled: 0 };
+    }
+    const accessToken = await this.accessTokenFor(refreshToken);
+    const startId = (await this.getHistoryId()) || historyId;
+    return this._pull(accessToken, startId, emailAddress);
+  }
+
+  /**
+   * Poll the central inbox on a timer — the fetch path when there is no Pub/Sub
+   * push (no public webhook). Pulls everything new since the stored cursor and
+   * routes it through the same attribute → emit pipeline as a push. No-ops until
+   * the inbox is connected. Self-heals a stale cursor (Gmail keeps ~1 week of
+   * history) by re-seeding from the current mailbox state.
+   */
+  async poll() {
+    const refreshToken = await this.getRefreshToken();
+    if (!refreshToken) return { handled: 0, connected: false };
+    const accessToken = await this.accessTokenFor(refreshToken);
+    let startId = await this.getHistoryId();
+    // Fetch the profile only when we must (unknown cursor or unknown central
+    // address). Steady-state polls then cost just a single history.list call.
+    if (!startId || !this._centralAddress) {
+      const profile = await this.getProfile(accessToken);
+      this._centralAddress = profile.emailAddress;
+      if (!startId) startId = String(profile.historyId);
+    }
+    try {
+      return await this._pull(accessToken, startId, this._centralAddress);
+    } catch (e) {
+      if (/-> 404/.test(String(e.message))) {
+        const profile = await this.getProfile(accessToken);
+        this._centralAddress = profile.emailAddress;
+        this.log.warn('history cursor stale — re-seeding', { from: startId, to: profile.historyId });
+        await this.saveHistoryId(String(profile.historyId));
+        return { handled: 0, reseeded: true };
+      }
+      throw e;
+    }
+  }
+
+  /** Pull messages added since `startId`, attribute each, emit, advance cursor. */
+  async _pull(accessToken, startId, centralAddress) {
+    const hist = await this.api(
+      accessToken,
+      `/users/me/history?startHistoryId=${encodeURIComponent(startId)}&historyTypes=messageAdded`
+    );
+
+    const messageIds = new Set();
+    for (const h of hist.history || []) {
+      for (const ma of h.messagesAdded || []) messageIds.add(ma.message.id);
+    }
+
+    let handled = 0;
+    let unattributed = 0;
+    for (const id of messageIds) {
+      const msg = await this.api(accessToken, `/users/me/messages/${id}?format=full`);
+      const decoded = decodeGmailMessage(msg);
+      const order = parseOrderEmail(decoded);
+      if (!order.isOrder || !order.orderId) continue;
+
+      this.log.info('order detected', { orderId: order.orderId, source: 'gmail', address: order.address });
+
+      const { account, address, via, candidates } = await this._attribute(decoded.headers, centralAddress);
+      if (!account) {
+        // Quarantine: a real order we cannot tie to a registered user. NEVER act
+        // on an order we can't attribute — that would touch the wrong account.
+        unattributed++;
+        this.log.warn('order email could not be attributed to a user', {
+          orderId: order.orderId,
+          candidates: candidates.map((c) => c.address),
+        });
+        if (this.onUnattributed) {
+          try {
+            this.onUnattributed({
+              orderId: order.orderId,
+              address: order.address,
+              state: order.state,
+              zip: order.zip,
+              source: 'gmail',
+              forwardingEmail: candidates[0]?.address || null, // the address we found (e.g. from BCC/forward)
+              via: candidates[0]?.via || null,
+              candidates: candidates.map((c) => c.address),
+            });
+          } catch {
+            /* recording must never break the pull */
+          }
+        }
+        continue;
+      }
+
+      handled++;
+      this.log.info('order email attributed', {
+        orderId: order.orderId,
+        account: account.label || account.id,
+        forwardedFrom: address,
+        via,
+      });
+      this.onOrder({
+        orderId: order.orderId,
+        acceptUrl: order.acceptUrl,
+        declineUrl: order.declineUrl,
+        address: order.address,
+        zip: order.zip,
+        state: order.state,
+        source: 'gmail',
+        accountId: account.id,
+        forwardingEmail: address,
+        // Gmail's own receipt timestamp for this message — the only honest
+        // anchor for "when did this order actually become available" over
+        // email. Lets handleOrder() measure real detection latency instead of
+        // guessing from our own poll interval.
+        emailReceivedAt: decoded.internalDate,
+      });
+    }
+
+    // Advance the central cursor.
+    if (hist.historyId) await this.saveHistoryId(String(hist.historyId));
+    return { handled, unattributed };
+  }
+
+  /**
+   * SAFE TEST: scan recent inbox messages and report what WOULD happen for each
+   * order — attribution + the per-user region decision — WITHOUT touching any
+   * portal (no accept, no decline). Read-only; needs only gmail.readonly.
+   * @param {object} [opts]
+   * @param {number} [opts.max]    how many recent messages to scan
+   * @param {string} [opts.query]  Gmail search query
+   * @returns {Promise<{scanned:number, orders:object[]}>}
+   */
+  async dryRunRecent({ max = 10, query = 'from:valuelinkams.com' } = {}) {
+    const refreshToken = await this.getRefreshToken();
+    if (!refreshToken) throw new Error('central inbox not connected');
+    const accessToken = await this.accessTokenFor(refreshToken);
+    const profile = await this.getProfile(accessToken);
+
+    const list = await this.api(
+      accessToken,
+      `/users/me/messages?maxResults=${encodeURIComponent(max)}&q=${encodeURIComponent(query)}`
+    );
+
+    const orders = [];
+    for (const m of list.messages || []) {
+      const msg = await this.api(accessToken, `/users/me/messages/${m.id}?format=full`);
+      const decoded = decodeGmailMessage(msg);
+      const order = parseOrderEmail(decoded);
+      if (!order.isOrder || !order.orderId) continue;
+
+      const { account, address, via, candidates } = await this._attribute(decoded.headers, profile.emailAddress);
+      let decision = 'unattributed';
+      let region;
+      if (account) {
+        region = orderMatchesRegion(account, { address: order.address, zip: order.zip, state: order.state });
+        decision = region.allowed ? 'WOULD_ACCEPT' : region.decided ? 'WOULD_DECLINE' : 'SKIP_undetermined';
+      }
+      orders.push({
+        orderId: order.orderId,
+        address: order.address,
+        state: order.state,
+        zip: order.zip,
+        accountId: account ? account.id || null : null,
+        attributedTo: account ? account.label || account.id : null,
+        forwardingEmail: address || null,
+        via: via || null,
+        decision,
+        reason: region?.reason,
+        regionRule: account ? { states: account.regionStates, zipPrefixes: account.regionZipPrefixes } : undefined,
+        unmatchedCandidates: account ? undefined : (candidates || []).map((c) => ({ address: c.address, via: c.via })),
+      });
+    }
+    return { scanned: (list.messages || []).length, orders };
+  }
+}
+
+export default GmailWatcher;
+===CAT_session===
+// Authenticated portal session for ONE E-Street/ValueLink account.
+//
+// Holds a warm keep-alive HttpClient + cookie jar, performs the WebForms login
+// (scrape hidden fields -> POST credentials), and re-authenticates transparently
+// when a request bounces to the login page. Kept warm so the accept postback
+// never pays a login round-trip in the hot path.
+import { HttpClient } from '../util/httpClient.js';
+import { scrapeHiddenFields, looksLikeLogin, looksLikeOtpPage } from './aspnet.js';
+import { logger } from '../util/logger.js';
+
+/**
+ * @typedef {object} PortalRoutes
+ * @property {string} login      e.g. '/login.aspx'
+ * @property {string} newOrders  e.g. '/AppraiserDashboard.aspx'
+ * @property {(orderId:string)=>string} [status] order-status URL builder
+ */
+
+// Every vendor account is the same E-Street/ValueLink deployment (confirmed
+// against the real portal) — only the credentials differ per account. These
+// are overridable per-account (portalRoutes/portalFields) for the rare
+// AMC that white-labels a differently-structured instance.
+const DEFAULT_ROUTES = {
+  login: '/login.aspx',
+  newOrders: '/AppraiserDashboard.aspx',
+  status: (orderId) => `/Orders/OrderStatus.aspx?order=${encodeURIComponent(orderId)}`,
+};
+
+const DEFAULT_FIELDS = {
+  username: 'ctl00$cphBody$Login1$UserName',
+  password: 'ctl00$cphBody$Login1$Password',
+  submit: 'ctl00$cphBody$Login1$LoginButton',
+  submitValue: 'Log In',
+};
+
+// Every account requires a 6-digit email-OTP step on login (no "remember this
+// device"). Reactive: PortalSession only submits this if the post-login page
+// actually looks like an OTP challenge, so it's harmless for any account that
+// doesn't hit one. Override/disable via account.otpFields (pass null to skip
+// entirely).
+const DEFAULT_OTP_FIELDS = {
+  code: 'ctl00$cphBody$txtUserCode',
+  submit: 'ctl00$cphBody$btnVerifyLogin',
+  submitValue: 'Verify',
+};
+
+/** Thrown when the portal returns a hard throttle / forbid status (403/429). */
+export class PortalHttpError extends Error {
+  /**
+   * @param {number} status
+   * @param {string} [message]
+   */
+  constructor(status, message) {
+    super(message || `Portal HTTP ${status}`);
+    this.name = 'PortalHttpError';
+    this.status = status;
+    this.isThrottle = status === 403 || status === 429;
+  }
+}
+
+export class PortalSession {
+  /**
+   * @param {object} cfg
+   * @param {string} cfg.baseUrl
+   * @param {string} cfg.username
+   * @param {string} cfg.password
+   * @param {Partial<PortalRoutes>} [cfg.routes]
+   * @param {object} [cfg.fields]
+   * @param {string} [cfg.label]
+   * @param {object|null} [cfg.otpFields]  { code, submit, submitValue } — override the
+   *        default email-OTP fields, or pass null to disable the OTP step entirely.
+   * @param {(args:{sentAfter:number})=>Promise<string|null>} [cfg.fetchOtpCode]
+   *        resolves the emailed code; only invoked if an OTP page is actually hit.
+   * @param {object} [cfg.cookieStore]  a SessionCookieStore — if given (with
+   *        cfg.accountId), a saved session cookie is tried once before falling
+   *        back to a fresh username/password (+OTP) login. See resumeSession().
+   * @param {string} [cfg.accountId]
+   */
+  constructor(cfg) {
+    // Accept either origin (`https://host`) or a pasted dashboard URL
+    // (`https://host/AppraiserDashboard.aspx`). Routes are absolute-from-origin
+    // (`/login.aspx`, `/AppraiserDashboard.aspx`), so a base that already
+    // includes a page path produces broken URLs like
+    // `…/AppraiserDashboard.aspx/login.aspx` and login silently fails.
+    this.baseUrl = normalizePortalOrigin(cfg.baseUrl);
+    this.username = cfg.username;
+    this.password = cfg.password;
+    this.routes = { ...DEFAULT_ROUTES, ...(cfg.routes || {}) };
+    this.fields = { ...DEFAULT_FIELDS, ...(cfg.fields || {}) };
+    this.otpFields = cfg.otpFields === null ? null : { ...DEFAULT_OTP_FIELDS, ...(cfg.otpFields || {}) };
+    this.fetchOtpCode = cfg.fetchOtpCode || null;
+    this.http = new HttpClient({ timeoutMs: cfg.timeoutMs ?? 10000 });
+    this.log = (cfg.logger || logger)(`session:${cfg.label || this.username}`);
+    this.authenticated = false;
+    this._loginInFlight = null;
+    this.cookieStore = cfg.cookieStore || null;
+    this.accountId = cfg.accountId || null;
+    this._resumeAttempted = false;
+    // Last successful (non-bounced) response per path — lets a caller that
+    // opts in (see acceptViaPortal/declineViaPortal's `reuseCachedPage`) skip a
+    // fresh GET and replay a *very* recently seen page's VIEWSTATE directly.
+    // Never used unless a caller explicitly asks for it and checks freshness.
+    this._pageCache = new Map(); // path -> { body, status, ts }
+    // ASP.NET WebForms + one cookie jar: concurrent poller GET + Accept POST
+    // on the same session can corrupt server state → Error.aspx. Serialize.
+    this._httpGate = Promise.resolve();
+    this._gateDepth = 0;
+  }
+
+  /**
+   * Run portal HTTP exclusively for this account session (re-entrant so
+   * authedGet → login → http still works inside one hold).
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async _exclusive(fn) {
+    if (this._gateDepth > 0) return fn();
+    let release;
+    const done = new Promise((r) => {
+      release = r;
+    });
+    const prev = this._httpGate;
+    this._httpGate = done;
+    await prev;
+    this._gateDepth++;
+    try {
+      return await fn();
+    } finally {
+      this._gateDepth--;
+      release();
+    }
+  }
+
+  /** A recent successful GET response for `path`, if not older than `maxAgeMs`. */
+  getCachedPage(path, maxAgeMs) {
+    const c = this._pageCache.get(path);
+    if (!c || Date.now() - c.ts > maxAgeMs) return null;
+    return c;
+  }
+
+  url(path) {
+    return path.startsWith('http') ? path : this.baseUrl + path;
+  }
+
+  /** Warm the TLS connection ahead of time. */
+  async warmup() {
+    await this.http.warmup(this.url('/'));
+  }
+
+  /** Log in (idempotent / de-duplicated if called concurrently). */
+  async login() {
+    if (this._loginInFlight) return this._loginInFlight;
+    this._loginInFlight = this._login().finally(() => {
+      this._loginInFlight = null;
+    });
+    return this._loginInFlight;
+  }
+
+  async _login() {
+    // Try a saved cookie exactly once per process lifetime — same as a browser
+    // that was closed and reopened, not something worth re-checking on every
+    // re-auth-after-bounce (that cookie just proved itself invalid).
+    if (!this._resumeAttempted && this.cookieStore && this.accountId) {
+      this._resumeAttempted = true;
+      if (await this._resumeSession()) return;
+    }
+    return this._doLogin();
+  }
+
+  /**
+   * Try reusing a previously-saved session cookie instead of a fresh
+   * username/password (+OTP) login — the reason a closed-and-reopened browser
+   * doesn't get asked for credentials again is that the cookie the portal
+   * already trusts is still sitting in its cookie storage; our in-memory
+   * CookieJar just doesn't survive a process restart on its own. Falls back to
+   * a normal login if there's no saved cookie or the portal no longer honors it.
+   * @returns {Promise<boolean>} true if the saved cookie was still valid
+   */
+  async _resumeSession() {
+    const saved = await this.cookieStore.get(this.accountId);
+    if (!saved) return false;
+    this.http.jar.import(saved);
+    const res = await this.http.get(this.url(this.routes.newOrders), { followRedirects: true });
+    if (looksLikeLogin(res.body) || res.status >= 400) {
+      this.http.jar.clear();
+      this.log.info('saved session cookie is no longer valid, logging in fresh');
+      return false;
+    }
+    this.authenticated = true;
+    this.log.info('resumed session from a saved cookie — no login/OTP needed');
+    return true;
+  }
+
+  async _doLogin() {
+    this._lastLoginUsedOtp = false; // reset per attempt; set by _submitOtp below
+    // Fresh login must not carry cookies from a failed resume — a half-dead
+    // ASP.NET_SessionId can make a correct password look like a failed attempt.
+    this.http.jar.clear();
+    const loginUrl = this.url(this.routes.login);
+    const page = await this.http.get(loginUrl, { followRedirects: true });
+    this._assertNotThrottled(page);
+    // Post back to the URL we actually landed on (after redirects), not the
+    // pre-redirect loginUrl — ViewState is bound to that page.
+    const postUrl = page.url || loginUrl;
+    const hidden = scrapeHiddenFields(page.body);
+    // Match the real Login button's DoPostBackWithOptions(clientSubmit=false):
+    // a normal browser form submit with the submit control's name=value only.
+    // Do NOT set __EVENTTARGET to the LoginButton — that path is for LinkButtons
+    // / __doPostBack, and on this portal it makes a correct password look like
+    // "Your login attempt was not successful" (no OTP page ever appears).
+    const body = {
+      ...hidden,
+      [this.fields.username]: this.username,
+      [this.fields.password]: this.password,
+    };
+    if (this.fields.submit) {
+      body[this.fields.submit] = this.fields.submitValue;
+    }
+
+    const attemptedAt = Date.now();
+    let res = await this.http.post(postUrl, formEncodeObj(body), {
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        referer: postUrl,
+      },
+      followRedirects: true,
+    });
+    this._assertNotThrottled(res);
+
+    if (looksLikeOtpPage(res.body)) {
+      res = await this._submitOtp(postUrl, res.body, attemptedAt);
+    }
+
+    // Success = we landed somewhere that is NOT the login page.
+    const ok = !looksLikeLogin(res.body) && res.status < 400;
+    this.authenticated = ok;
+    if (!ok) {
+      const portalMsg = extractLoginError(res.body);
+      this.log.error('login failed', {
+        status: res.status,
+        portalMsg: portalMsg || undefined,
+        looksOtp: looksLikeOtpPage(res.body),
+        bodySnippet: snippet(res.body),
+      });
+      // Persist the full response so a field-name / OTP / captcha miss is
+      // diagnosable without re-running against a live account.
+      try {
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile('/root/Estreet/data/login-fail.html', res.body || '', 'utf8');
+      } catch {
+        /* best-effort */
+      }
+      const detail = portalMsg || snippet(res.body);
+      throw new Error(`Portal login failed for ${this.username} (status ${res.status}): ${detail}`);
+    }
+    this.log.info('login ok', { ms: Math.round(res.durationMs) });
+    if (this.cookieStore && this.accountId) {
+      try {
+        await this.cookieStore.save(this.accountId, this.http.jar.export());
+      } catch (e) {
+        this.log.warn('failed to persist session cookie', { err: String(e) });
+      }
+    }
+    return res;
+  }
+
+  /** Complete the email-OTP challenge that follows a correct username/password. */
+  async _submitOtp(loginUrl, otpPageHtml, attemptedAt) {
+    if (!this.otpFields || !this.fetchOtpCode) {
+      throw new Error(
+        `Portal login for ${this.username} hit a 2FA/verification-code page but no otpFields/fetchOtpCode is configured`
+      );
+    }
+    this.log.info('otp challenge — waiting for emailed code');
+    const code = await this.fetchOtpCode({ sentAfter: attemptedAt });
+    if (!code) {
+      this.log.error('otp fetch failed: no code arrived in time', { sentAfter: attemptedAt });
+      throw new Error(`Portal login for ${this.username}: no OTP code arrived in time`);
+    }
+    this.log.info('otp fetched', { sentAfter: attemptedAt });
+    this._lastLoginUsedOtp = true;
+
+    const hidden = scrapeHiddenFields(otpPageHtml);
+    const body = { ...hidden, [this.otpFields.code]: code };
+    if (this.otpFields.submit) body[this.otpFields.submit] = this.otpFields.submitValue;
+
+    return this.http.post(loginUrl, formEncodeObj(body), {
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      followRedirects: true,
+    });
+  }
+
+  /**
+   * GET a page, auto-re-login once if we got bounced to the login screen, and
+   * retry once on a bare request timeout (the portal is occasionally slow to
+   * respond; a single retry is cheap relative to losing the order entirely).
+   * Returns the raw HttpClient response.
+   */
+  async authedGet(path, { retried = false, retriedTimeout = false } = {}) {
+    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout }));
+  }
+
+  async _authedGet(path, { retried = false, retriedTimeout = false } = {}) {
+    if (!this.authenticated) await this.login();
+    let res;
+    try {
+      res = await this.http.get(this.url(path), { followRedirects: true });
+    } catch (e) {
+      if (!retriedTimeout && /timeout/i.test(String(e?.message))) {
+        this.log.warn('request timed out, retrying once', { path });
+        const r = await this._authedGet(path, { retried, retriedTimeout: true });
+        return { ...r, _reauthed: true };
+      }
+      throw e;
+    }
+    this._assertNotThrottled(res);
+    if (this._isBounced(res) && !retried) {
+      this.log.warn('login required', { path });
+      this.log.info('re-authenticating');
+      this.authenticated = false;
+      await this.login();
+      this.log.info('login successful — retrying request', { path });
+      const r = await this._authedGet(path, { retried: true, retriedTimeout });
+      return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
+    }
+    this._pageCache.set(path, { body: res.body, status: res.status, ts: Date.now() });
+    return res;
+  }
+
+  /** POST a form to an authed page, re-login once on bounce (retries the EXACT
+   *  same body — the caller is responsible for scraping fresh VIEWSTATE via a
+   *  prior authedGet, so a bounce here means the session died between that GET
+   *  and this POST, not that the tokens are stale). */
+  async authedPost(path, body, { retried = false, headers } = {}) {
+    return this._exclusive(() => this._authedPost(path, body, { retried, headers }));
+  }
+
+  async _authedPost(path, body, { retried = false, headers } = {}) {
+    if (!this.authenticated) await this.login();
+    const res = await this.http.post(this.url(path), formEncodeObj(body), {
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
+      followRedirects: true,
+    });
+    this._assertNotThrottled(res);
+    if (this._isBounced(res) && !retried) {
+      this.log.warn('login required', { path });
+      this.log.info('re-authenticating');
+      this.authenticated = false;
+      await this.login();
+      this.log.info('login successful — retrying request', { path });
+      const r = await this._authedPost(path, body, { retried: true, headers });
+      return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
+    }
+    return res;
+  }
+
+  _assertNotThrottled(res) {
+    if (res?.status === 403 || res?.status === 429) {
+      throw new PortalHttpError(res.status, `Portal HTTP ${res.status}`);
+    }
+  }
+
+  _isBounced(res) {
+    return looksLikeLogin(res.body) || /login/i.test(res.headers?.location || '');
+  }
+
+  close() {
+    this.http.destroy();
+  }
+}
+
+function formEncodeObj(obj) {
+  // URLSearchParams matches browser form encoding (space -> +, @ -> %40, etc.)
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj)) params.append(k, v ?? '');
+  return params.toString();
+}
+
+/** First ~300 chars of a response body, for debug logs — never log the whole page. */
+function snippet(body, max = 300) {
+  if (!body) return '';
+  const s = String(body).replace(/\s+/g, ' ').trim();
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+/**
+ * Collapse a pasted portal URL down to its origin. Operators often paste the
+ * dashboard address (`https://host/AppraiserDashboard.aspx`); routes already
+ * include those paths, so keeping the page segment breaks login/newOrders.
+ */
+export function normalizePortalOrigin(baseUrl) {
+  const raw = String(baseUrl || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return u.origin;
+  } catch {
+    return raw.replace(/\/$/, '');
+  }
+}
+
+/** Pull the visible ASP.NET Login failure text out of a login-page response. */
+function extractLoginError(html) {
+  if (!html) return null;
+  const patterns = [
+    /Your login attempt was not successful[^.<]*/i,
+    /Invalid (?:credentials|user name or password)[^.<]*/i,
+    /account (?:has been )?locked[^.<]*/i,
+    /too many (?:failed )?login attempts[^.<]*/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) return m[0].replace(/\s+/g, ' ').trim();
+  }
+  return null;
+}
+
+export default PortalSession;
+export { snippet };
+===CAT_aspnet===
+// Helpers for ASP.NET WebForms pages (which ValueLink/E-Street is built on).
+//
+// WebForms drives almost every action through a __doPostBack(eventTarget, arg)
+// that submits the whole <form> including the hidden state fields __VIEWSTATE,
+// __VIEWSTATEGENERATOR and __EVENTVALIDATION. To replay an action as raw HTTP we
+// must (1) scrape those fields fresh from the current page and (2) post them
+// back with __EVENTTARGET set to the control that was "clicked".
+
+const HIDDEN_FIELD_NAMES = [
+  '__VIEWSTATE',
+  '__VIEWSTATEGENERATOR',
+  '__EVENTVALIDATION',
+  '__VIEWSTATEENCRYPTED',
+  '__PREVIOUSPAGE',
+  '__SCROLLPOSITIONX',
+  '__SCROLLPOSITIONY',
+];
+
+/** Scrape ALL <input type=hidden> name/value pairs from an HTML page. */
+export function scrapeHiddenFields(html) {
+  const fields = {};
+  const inputRe = /<input\b[^>]*>/gi;
+  let m;
+  while ((m = inputRe.exec(html))) {
+    const tag = m[0];
+    const type = attr(tag, 'type');
+    const name = attr(tag, 'name');
+    if (!name) continue;
+    if (type && type.toLowerCase() !== 'hidden') continue;
+    fields[name] = decodeAttr(attr(tag, 'value') ?? '');
+  }
+  return fields;
+}
+
+/** Scrape only the canonical WebForms state fields. */
+export function scrapeViewState(html) {
+  const all = scrapeHiddenFields(html);
+  const out = {};
+  for (const name of HIDDEN_FIELD_NAMES) if (name in all) out[name] = all[name];
+  return out;
+}
+
+/** Build a postback body that simulates clicking `eventTarget`. */
+export function buildPostback(html, eventTarget, eventArgument = '', extra = {}) {
+  const body = {
+    ...scrapeHiddenFields(html),
+    __EVENTTARGET: eventTarget,
+    __EVENTARGUMENT: eventArgument,
+    ...extra,
+  };
+  return body;
+}
+
+/**
+ * Find the __doPostBack event target for a control, by matching nearby text.
+ * Returns the control name to put in __EVENTTARGET, or null.
+ * Handles:
+ *   - link buttons (href="javascript:__doPostBack('target','arg')")
+ *   - submit buttons (<input type=submit name="target" value="Accept">)
+ *   - image buttons (<input type=image name="…imgBtnBroadcastAccept" title="…accept…">)
+ *     — the real E-Street New Orders Accept/Decline controls are type=image ticks.
+ */
+export function findPostbackTarget(html, labelRe) {
+  // 1) Anchor/link buttons with __doPostBack in href or onclick.
+  const aRe = /<a\b[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = aRe.exec(html))) {
+    const tag = m[0];
+    const text = m[1].replace(/<[^>]+>/g, ' ').trim();
+    const onclickOrHref = `${attr(tag, 'href') ?? ''} ${attr(tag, 'onclick') ?? ''}`;
+    const pb = onclickOrHref.match(/__doPostBack\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]/i);
+    if (pb && labelRe.test(text)) return { target: pb[1], argument: pb[2] };
+  }
+  // 2) Submit/button/image inputs.
+  const inputRe = /<input\b[^>]*>/gi;
+  while ((m = inputRe.exec(html))) {
+    const tag = m[0];
+    const type = (attr(tag, 'type') || '').toLowerCase();
+    const name = attr(tag, 'name');
+    if (!name) continue;
+    if (type === 'submit' || type === 'button') {
+      const value = attr(tag, 'value') || '';
+      if (labelRe.test(value)) return { target: name, argument: '', isSubmit: true, submitValue: value };
+      continue;
+    }
+    // ASP.NET ImageButton → <input type="image">. A click posts name.x / name.y
+    // (not __EVENTTARGET). Match name/id/title/alt so "Accept" finds
+    // imgBtnBroadcastAccept ("Click here to accept this order").
+    if (type === 'image') {
+      const hay = [name, attr(tag, 'id') || '', attr(tag, 'title') || '', attr(tag, 'alt') || ''].join(' ');
+      if (labelRe.test(hay)) return { target: name, argument: '', isImage: true };
+    }
+  }
+  // 3) <button> elements.
+  const btnRe = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
+  while ((m = btnRe.exec(html))) {
+    const attrs = m[1];
+    const text = m[2].replace(/<[^>]+>/g, ' ').trim();
+    const name = attr(`<x ${attrs}>`, 'name');
+    if (name && labelRe.test(text)) return { target: name, argument: '', isSubmit: true, submitValue: text };
+  }
+  return null;
+}
+
+/**
+ * Build the form body that simulates clicking a control returned by
+ * findPostbackTarget (link / submit / image).
+ */
+export function buildControlClick(html, pb) {
+  const extra = { ...(pb.extra || {}) };
+  if (pb.isSubmit && pb.submitValue) extra[pb.target] = pb.submitValue;
+  // Image buttons are identified by the presence of name.x / name.y in the POST
+  // (browser click coordinates). ASP.NET does not need __EVENTTARGET for them.
+  if (pb.isImage) {
+    extra[`${pb.target}.x`] = '1';
+    extra[`${pb.target}.y`] = '1';
+  }
+  const useEventTarget = !pb.isSubmit && !pb.isImage;
+  const body = buildPostback(html, useEventTarget ? pb.target : '', pb.argument || '', extra);
+  if (useEventTarget) body.__EVENTTARGET = pb.target;
+  return body;
+}
+
+/** Resolve the first <form action="..."> against a base URL. */
+export function scrapeFormAction(html, baseUrl) {
+  const m = html.match(/<form\b[^>]*\baction\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i);
+  if (!m) return baseUrl;
+  // HTML serializers encode & as &amp; in attribute values; decode before URL().
+  const action = decodeAttr((m[2] ?? m[3] ?? m[4] ?? '').trim());
+  if (!action || action === '#') return baseUrl;
+  try {
+    return new URL(action, baseUrl).toString();
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
+ * Resolve the POST URL for a specific control: prefers that control's
+ * `formaction` (Accept vs Decline on one confirmation form), else the enclosing
+ * / first form action.
+ */
+export function scrapeFormActionForControl(html, baseUrl, controlName) {
+  if (controlName && html) {
+    const inputRe = /<input\b[^>]*>/gi;
+    let m;
+    while ((m = inputRe.exec(html))) {
+      const tag = m[0];
+      if (attr(tag, 'name') !== controlName) continue;
+      const formaction = decodeAttr(attr(tag, 'formaction') ?? '');
+      if (formaction && formaction !== '#') {
+        try {
+          return new URL(formaction, baseUrl).toString();
+        } catch {
+          /* fall through */
+        }
+      }
+      break;
+    }
+  }
+  return scrapeFormAction(html, baseUrl);
+}
+
+/** Heuristic: does this HTML look like a login page (i.e. we got bounced)? */
+export function looksLikeLogin(html) {
+  if (!html) return false;
+  const h = html.toLowerCase();
+  const hasPassword = /<input[^>]*type\s*=\s*['"]?password/i.test(html);
+  const mentionsLogin = /log\s*in|sign\s*in|forgot your password|user\s*name/i.test(h);
+  return hasPassword && mentionsLogin;
+}
+
+/** Heuristic: does this HTML look like a post-login email-OTP challenge page? */
+export function looksLikeOtpPage(html) {
+  if (!html) return false;
+  const h = html.toLowerCase();
+  const mentionsCode = /verification code|enter.{0,20}\bcode\b|6.?digit code/i.test(h);
+  const hasCodeInput = /<input[^>]*maxlength\s*=\s*['"]?6['"]?[^>]*>/i.test(html);
+  return mentionsCode && hasCodeInput;
+}
+
+// Common ASP.NET WebForms phrasing for a rejected/stale postback — distinct
+// from a login bounce (looksLikeLogin): the session IS authenticated, but the
+// __VIEWSTATE/__EVENTVALIDATION we posted no longer matches what the server
+// expects. Used only by the opt-in cached-page reuse path (see portalAccept.js
+// / portalDecline.js) to detect "the cached page's tokens were stale — redo
+// this with a guaranteed-fresh GET" without mistaking it for a real failure.
+export function looksLikeStaleState(html) {
+  if (!html) return false;
+  return /session (has )?expired|invalid\s+viewstate|viewstate is invalid|unable to validate data|validateantiforgerytoken/i.test(
+    html
+  );
+}
+
+// ── tiny attribute reader ────────────────────────────────────────────────────
+function attr(tag, name) {
+  const re = new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i');
+  const m = tag.match(re);
+  if (!m) return undefined;
+  return m[2] ?? m[3] ?? m[4];
+}
+
+function decodeAttr(s) {
+  return s
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+export { attr as _attr };
+===CAT_httpClient===
+// Keep-alive HTTP client with a cookie jar, built on node:http/node:https.
+//
+// Why not fetch(): we need (1) persistent keep-alive agents so the accept call
+// reuses a warm TLS connection (no handshake in the hot path), (2) explicit
+// control over redirect-following so we can DETECT a 302 -> /login bounce
+// (the central "is the email link a standalone GET?" question), and
+// (3) a cookie jar to hold the authenticated ASP.NET session per account.
+import http from 'node:http';
+import https from 'node:https';
+import { URL } from 'node:url';
+
+/** Minimal cookie jar: stores name=value per host, serializes on each request. */
+export class CookieJar {
+  constructor() {
+    this.byHost = new Map(); // host -> Map(name -> value)
+  }
+  setFromHeaders(host, setCookieHeaders) {
+    if (!setCookieHeaders) return;
+    const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+    const jar = this.byHost.get(host) ?? new Map();
+    for (const raw of arr) {
+      const [pair] = raw.split(';');
+      const idx = pair.indexOf('=');
+      if (idx === -1) continue;
+      const name = pair.slice(0, idx).trim();
+      const value = pair.slice(idx + 1).trim();
+      if (/expires=Thu, 01 Jan 1970/i.test(raw) || /max-age=0/i.test(raw)) jar.delete(name);
+      else jar.set(name, value);
+    }
+    this.byHost.set(host, jar);
+  }
+  header(host) {
+    const jar = this.byHost.get(host);
+    if (!jar || jar.size === 0) return undefined;
+    return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+  }
+  clear(host) {
+    if (host) this.byHost.delete(host);
+    else this.byHost.clear();
+  }
+  /** Plain-object snapshot of every cookie, for persisting across restarts. */
+  export() {
+    const out = {};
+    for (const [host, jar] of this.byHost) out[host] = Object.fromEntries(jar);
+    return out;
+  }
+  /** Restore cookies from a snapshot produced by export(). */
+  import(snapshot) {
+    for (const [host, cookies] of Object.entries(snapshot || {})) {
+      this.byHost.set(host, new Map(Object.entries(cookies)));
+    }
+  }
+}
+
+export class HttpClient {
+  /**
+   * @param {object} opts
+   * @param {CookieJar} [opts.jar]
+   * @param {object}   [opts.defaultHeaders]
+   * @param {number}   [opts.timeoutMs]
+   */
+  constructor({ jar = new CookieJar(), defaultHeaders = {}, timeoutMs = 10000 } = {}) {
+    this.jar = jar;
+    this.timeoutMs = timeoutMs;
+    this.defaultHeaders = {
+      'user-agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      ...defaultHeaders,
+    };
+    // Warm, reused connection pools — the key latency optimization.
+    this.httpAgent = new http.Agent({ keepAlive: true, maxSockets: 8 });
+    this.httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8 });
+  }
+
+  /**
+   * Perform a single request WITHOUT following redirects.
+   * Returns { status, headers, body, location, redirected:false, durationMs }.
+   */
+  request(urlStr, { method = 'GET', headers = {}, body, followRedirects = false } = {}) {
+    const startedAt = process.hrtime.bigint();
+    const u = new URL(urlStr);
+    const isHttps = u.protocol === 'https:';
+    const lib = isHttps ? https : http;
+    const agent = isHttps ? this.httpsAgent : this.httpAgent;
+
+    const cookieHeader = this.jar.header(u.host);
+    const reqHeaders = { ...this.defaultHeaders, ...headers };
+    if (cookieHeader) reqHeaders['cookie'] = cookieHeader;
+
+    let payload;
+    if (body != null) {
+      payload = typeof body === 'string' ? body : Buffer.from(body);
+      if (!reqHeaders['content-type']) {
+        reqHeaders['content-type'] = 'application/x-www-form-urlencoded';
+      }
+      reqHeaders['content-length'] = Buffer.byteLength(payload);
+    }
+
+    return new Promise((resolve, reject) => {
+      const req = lib.request(
+        {
+          protocol: u.protocol,
+          hostname: u.hostname,
+          port: u.port || (isHttps ? 443 : 80),
+          path: u.pathname + u.search,
+          method,
+          headers: reqHeaders,
+          agent,
+        },
+        (res) => {
+          this.jar.setFromHeaders(u.host, res.headers['set-cookie']);
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', async () => {
+            const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+            const result = {
+              status: res.statusCode,
+              headers: res.headers,
+              body: Buffer.concat(chunks).toString('utf8'),
+              location: res.headers['location'],
+              redirected: false,
+              url: urlStr,
+              durationMs,
+            };
+            // Optionally chase one redirect chain (kept explicit & shallow).
+            // Browsers treat 301/302/303 after POST as GET to the Location
+            // (ASP.NET Error.aspx / login redirects rely on this). Re-POSTing
+            // the body to Error.aspx is wrong and masks the real outcome.
+            if (
+              followRedirects &&
+              [301, 302, 303, 307, 308].includes(res.statusCode) &&
+              result.location
+            ) {
+              try {
+                const next = new URL(result.location, urlStr).toString();
+                const forceGet =
+                  method !== 'GET' &&
+                  method !== 'HEAD' &&
+                  (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301);
+                const nextMethod = forceGet ? 'GET' : method;
+                const r2 = await this.request(next, {
+                  method: nextMethod,
+                  headers,
+                  body: nextMethod === 'GET' || nextMethod === 'HEAD' ? undefined : body,
+                  followRedirects,
+                });
+                return resolve({
+                  ...r2,
+                  redirected: true,
+                  redirectedFrom: urlStr,
+                  // Prefer total time across the hop when available.
+                  durationMs: (result.durationMs || 0) + (r2.durationMs || 0),
+                });
+              } catch (e) {
+                return reject(e);
+              }
+            }
+            resolve(result);
+          });
+        }
+      );
+      req.setTimeout(this.timeoutMs, () => req.destroy(new Error(`Request timeout: ${urlStr}`)));
+      req.on('error', reject);
+      if (payload != null) req.write(payload);
+      req.end();
+    });
+  }
+
+  get(url, opts) {
+    return this.request(url, { ...opts, method: 'GET' });
+  }
+  post(url, body, opts) {
+    return this.request(url, { ...opts, method: 'POST', body });
+  }
+
+  /** Pre-open a connection to a host so the first real request skips the handshake. */
+  async warmup(urlStr) {
+    try {
+      await this.get(urlStr);
+    } catch {
+      /* warmup is best-effort */
+    }
+  }
+
+  destroy() {
+    this.httpAgent.destroy();
+    this.httpsAgent.destroy();
+  }
+}
+
+export function formEncode(obj) {
+  return Object.entries(obj)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v ?? '')}`)
+    .join('&');
+}
+
+export default HttpClient;
+===CAT_worker===
+// AccountWorker — everything for ONE account, fully isolated.
+//
+// Owns: its portal session (cookie jar), its detectors (portal poller + the
+// Gmail detector feeds in externally via onOrder), its historyId cursor. Shares
+// only the Redis lock (exactly-once) with the rest of the fleet. Designed to run
+// as its own process/container so a crash/revocation only takes down this one.
+//
+// One session for poll + accept so the poller's fresh New Orders HTML can be
+// reused on the accept postback (skips a GET on the hot path). Session HTTP is
+// serialized via PortalSession._exclusive.
+import { PortalSession } from '../portal/session.js';
+import { PortalPoller } from '../detect/portalPoller.js';
+import { executeAccept } from '../accept/acceptExecutor.js';
+import { executeDecline } from '../accept/declineExecutor.js';
+import { makePortalVerifier } from '../accept/verifier.js';
+import { orderLockKey } from '../lock/lock.js';
+import { orderMatchesRegion } from '../util/regionFilter.js';
+import { logger } from '../util/logger.js';
+
+export class AccountWorker {
+  /**
+   * @param {object} opts
+   * @param {object} opts.account  decrypted account config
+   * @param {object} opts.lock     shared lock instance
+   * @param {object} [opts.portalOpts] passed to acceptViaPortal (locator/label)
+   * @param {boolean} [opts.poll]  enable the portal poller (default true)
+   * @param {(event:object)=>void} [opts.onResult]  accept-result callback (metrics/notify)
+   * @param {(args:{sentAfter:number})=>Promise<string|null>} [opts.fetchOtpCode]
+   *        shared email-OTP resolver (see src/portal/emailOtp.js); only used when
+   *        the account sets `otpFields`.
+   * @param {object} [opts.cookieStore]  shared SessionCookieStore — lets this
+   *        account resume its portal session across process restarts instead
+   *        of logging in (and hitting OTP, if required) fresh every time.
+   */
+  constructor({ account, lock, portalOpts = {}, poll = true, onResult, fetchOtpCode, cookieStore, log = logger }) {
+    this.account = account;
+    this.lock = lock;
+    const reuseCachedPage =
+      !!account.reuseCachedPage || String(process.env.REUSE_CACHED_PAGE || '') === '1';
+    this.portalOpts = { reuseCachedPage, ...portalOpts };
+    this.enablePoll = poll;
+    this.onResult = onResult;
+    this.log = log(`worker:${account.label || account.id || account.portalUsername}`);
+
+    this.session = new PortalSession({
+      baseUrl: account.portalBaseUrl,
+      username: account.portalUsername,
+      password: account.portalPassword,
+      routes: account.portalRoutes,
+      fields: account.portalFields,
+      otpFields: account.otpFields,
+      fetchOtpCode,
+      cookieStore,
+      accountId: account.id,
+      label: account.label || account.portalUsername,
+    });
+    this.verify = makePortalVerifier(this.session);
+    this.poller = null;
+    this.stats = {
+      detected: 0,
+      accepted: 0,
+      taken: 0,
+      failed: 0,
+      deduped: 0,
+      declined: 0,
+      declineFailed: 0,
+      regionUnknown: 0,
+    };
+    this._started = false;
+  }
+
+  async start() {
+    if (this._started) return;
+    this._started = true;
+    await this.session.warmup();
+    await this.session.login();
+
+    if (this.enablePoll) {
+      this.poller = new PortalPoller({
+        session: this.session,
+        intervalMs: this.account.pollIntervalMs,
+        onOrder: (o) => this.handleOrder(o),
+      });
+      await this.poller.primeBaseline();
+      this.poller.start();
+    }
+    this.log.info('worker started', { account: this.account.portalUsername });
+  }
+
+  /** Clear portal poller circuit breaker and resume polling. */
+  resumePortalPoller() {
+    if (!this.poller) return false;
+    this.poller.resume();
+    this.log.info('portal poller resume requested');
+    return true;
+  }
+
+  /**
+   * Entry point for ANY detector (portal poller OR gmail watcher). Applies THIS
+   * account's region rule, then either accepts (in-region) or actively declines
+   * (out-of-region). Wins the lock → races strategy paths → verifies → reports.
+   * Idempotent per order via the lock.
+   */
+  async handleOrder(order) {
+    const { orderId, acceptUrl, declineUrl, source, address, zip, state, forwardingEmail, emailReceivedAt, previousPollAt } = order;
+    const detectedAt = Date.now();
+    this.stats.detected++;
+    this.log.info('order detected', { orderId, source, account: this.account.label, address, zip, state });
+
+    let detectionLatencyMs = null;
+    if (emailReceivedAt) detectionLatencyMs = detectedAt - emailReceivedAt;
+    else if (previousPollAt) detectionLatencyMs = detectedAt - previousPollAt;
+
+    const region = orderMatchesRegion(this.account, { address, zip, state });
+    const meta = {
+      orderId,
+      source,
+      address,
+      state: region.meta?.state ?? state ?? null,
+      zip: region.meta?.zip ?? zip ?? null,
+      account: this.account.label || this.account.portalUsername,
+      accountId: this.account.id || null,
+      forwardingEmail: forwardingEmail ?? this.account.forwardingEmail ?? null,
+    };
+
+    if (!region.allowed && !region.decided) {
+      this.stats.regionUnknown++;
+      this.log.warn('region matched: undetermined — not acting', { orderId, source, meta: region.meta });
+      return this._report({
+        ...meta,
+        action: 'skip',
+        accepted: false,
+        declined: false,
+        reason: 'region_unknown',
+        detectedAt,
+        detectionLatencyMs,
+      });
+    }
+    this.log.info('region matched', {
+      orderId,
+      decision: region.allowed ? 'in-region — will accept' : 'out-of-region — will decline',
+      reason: region.reason,
+      meta: region.meta,
+    });
+
+    const key = orderLockKey(`${this.account.id || this.account.portalUsername}:${orderId}`);
+    const lockStartedAt = Date.now();
+    const won = await this.lock.acquire(key);
+    const lockWaitMs = Date.now() - lockStartedAt;
+    if (!won) {
+      this.stats.deduped++;
+      this.log.debug('order already in flight, skipping', { orderId, source });
+      return { ...meta, action: region.allowed ? 'accept' : 'decline', deduped: true };
+    }
+
+    let event = region.allowed
+      ? await this._accept({ orderId, acceptUrl, source })
+      : await this._decline({ orderId, declineUrl, source, region });
+    const totalMs = Date.now() - detectedAt;
+    event = {
+      ...event,
+      address: meta.address,
+      state: meta.state,
+      zip: meta.zip,
+      account: meta.account,
+      accountId: meta.accountId,
+      forwardingEmail: meta.forwardingEmail,
+      detectedAt,
+      detectionLatencyMs,
+      lockWaitMs,
+      totalMs,
+    };
+
+    const acted = event.accepted || event.declined;
+    if (!acted) await this.lock.release(key);
+
+    return this._report(event);
+  }
+
+  _report(event) {
+    if (this.onResult) {
+      try {
+        this.onResult(event);
+      } catch (e) {
+        this.log.warn('onResult threw', { err: String(e) });
+      }
+    }
+    return event;
+  }
+
+  async _accept({ orderId, acceptUrl, source }) {
+    this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
+    let result;
+    try {
+      result = await executeAccept({
+        orderId,
+        acceptUrl,
+        session: this.session,
+        portalOpts: this.portalOpts,
+        verify: this.verify,
+        log: this.log.child('accept'),
+      });
+    } catch (e) {
+      result = { accepted: false, via: null, outcome: 'error', error: String(e) };
+      this.log.error('accept threw', { orderId, err: String(e) });
+    }
+    if (result.accepted) this.stats.accepted++;
+    else if (result.outcome === 'taken') this.stats.taken++;
+    else this.stats.failed++;
+    return { ...result, action: 'accept', declined: false, orderId, source, account: this.account.portalUsername };
+  }
+
+  async _decline({ orderId, declineUrl, source, region }) {
+    this.log.info('declining out-of-region order', {
+      orderId,
+      source,
+      reason: region.reason,
+      meta: region.meta,
+      hasEmailLink: !!declineUrl,
+    });
+    let result;
+    try {
+      result = await executeDecline({
+        orderId,
+        declineUrl,
+        session: this.session,
+        portalOpts: this.portalOpts,
+        verify: this.verify,
+        log: this.log.child('decline'),
+      });
+    } catch (e) {
+      result = { declined: false, via: null, outcome: 'error', error: String(e) };
+      this.log.error('decline threw', { orderId, err: String(e) });
+    }
+    if (result.declined) this.stats.declined++;
+    else this.stats.declineFailed++;
+    return {
+      ...result,
+      action: 'decline',
+      accepted: false,
+      orderId,
+      source,
+      reason: region.reason,
+      account: this.account.portalUsername,
+    };
+  }
+
+  async stop() {
+    if (this.poller) this.poller.stop();
+    this.session.close();
+    this._started = false;
+    this.log.info('worker stopped');
+  }
+}
+
+export default AccountWorker;
+===CAT_lock===
+// Lock interface + factory.
+//
+// The lock guarantees EXACTLY-ONCE accept per order across the whole fleet:
+// N Gmail webhooks + M portal pollers can all spot the same order, but only the
+// first to acquire `order:<id>` proceeds to accept. Everything else no-ops.
+//
+// Contract:
+//   acquire(key, ttlMs) -> Promise<boolean>   // true if THIS caller won
+//   release(key)        -> Promise<void>
+//   isHeld(key)         -> Promise<boolean>
+//   close()             -> Promise<void>
+
+import { MemoryLock } from './memoryLock.js';
+
+export function orderLockKey(orderId) {
+  return `order:${orderId}`;
+}
+
+/**
+ * @param {object} opts
+ * @param {'memory'|'redis'} [opts.backend]
+ * @param {string} [opts.redisUrl]
+ * @param {number} [opts.defaultTtlMs]
+ */
+export async function createLock({
+  backend = process.env.LOCK_BACKEND || 'memory',
+  redisUrl = process.env.REDIS_URL,
+  defaultTtlMs = Number(process.env.ORDER_LOCK_TTL_MS) || 120000,
+} = {}) {
+  if (backend === 'redis') {
+    // Lazy import so the `redis` package is only required when actually used.
+    const { RedisLock } = await import('./redisLock.js');
+    return RedisLock.connect({ redisUrl, defaultTtlMs });
+  }
+  return new MemoryLock({ defaultTtlMs });
+}
+===CAT_redisLock===
+// Redis-backed lock for multi-process fleets. Uses SET key value NX PX ttl,
+// the canonical atomic "acquire if absent with expiry" primitive. Release uses
+// a check-and-delete Lua script so a worker only releases a lock it still owns
+// (prevents releasing a lock that already expired and was re-acquired elsewhere).
+//
+// Requires the optional `redis` package:  npm install redis
+import { randomUUID } from 'node:crypto';
+
+const RELEASE_SCRIPT = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end`;
+
+export class RedisLock {
+  constructor(client, { defaultTtlMs = 120000 } = {}) {
+    this.client = client;
+    this.defaultTtlMs = defaultTtlMs;
+    this.tokens = new Map(); // key -> our ownership token
+  }
+
+  static async connect({ redisUrl = 'redis://127.0.0.1:6379', defaultTtlMs = 120000 } = {}) {
+    let redis;
+    try {
+      redis = await import('redis');
+    } catch {
+      throw new Error('LOCK_BACKEND=redis requires the "redis" package: npm install redis');
+    }
+    const client = redis.createClient({ url: redisUrl });
+    client.on('error', () => {}); // surfaced via acquire failures; don't crash the process
+    await client.connect();
+    return new RedisLock(client, { defaultTtlMs });
+  }
+
+  async acquire(key, ttlMs = this.defaultTtlMs) {
+    const token = randomUUID();
+    const ok = await this.client.set(key, token, { NX: true, PX: ttlMs });
+    if (ok === 'OK') {
+      this.tokens.set(key, token);
+      return true;
+    }
+    return false;
+  }
+
+  async release(key) {
+    const token = this.tokens.get(key);
+    if (!token) return;
+    try {
+      await this.client.eval(RELEASE_SCRIPT, { keys: [key], arguments: [token] });
+    } finally {
+      this.tokens.delete(key);
+    }
+  }
+
+  async isHeld(key) {
+    return (await this.client.exists(key)) === 1;
+  }
+
+  async close() {
+    try {
+      await this.client.quit();
+    } catch {
+      /* ignore */
+    }
+  }
+}

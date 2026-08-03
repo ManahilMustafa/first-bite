@@ -107,6 +107,7 @@ export class PortalPoller {
     this.consecutiveBlockErrors = 0;
     this.backoffLevel = 0;
     this.currentBackoffMs = this.intervalMs;
+    this._holds = 0;
     this.stats = {
       polls: 0,
       errors: 0,
@@ -134,6 +135,23 @@ export class PortalPoller {
     if (this._timer) return;
     this.log.info('poller started', { intervalMs: this.intervalMs });
     this._schedule(0);
+  }
+
+  /** Pause ticks while accept/decline owns the portal session (not a circuit). */
+  hold(reason = 'hold') {
+    this._holds = (this._holds || 0) + 1;
+    this.log.debug?.('poller hold', { reason, holds: this._holds });
+  }
+
+  release(reason = 'hold') {
+    this._holds = Math.max(0, (this._holds || 0) - 1);
+    this.log.debug?.('poller release', { reason, holds: this._holds });
+    // A tick may have been skipped while held; resume immediately so we don't
+    // sit blind until the next unrelated schedule (or forever if the timer
+    // already fired during the hold — see _tick early-return).
+    if (this._holds === 0 && !this._stopped && !this.paused && !this._running) {
+      this._schedule(0);
+    }
   }
 
   stop() {
@@ -203,7 +221,14 @@ export class PortalPoller {
   }
 
   async _tick() {
-    if (this._running || this._stopped || this.paused) return;
+    if (this._stopped || this.paused) return;
+    // Never drop the poll loop: a timer that fires while a tick is in-flight
+    // or the session is held used to return without rescheduling, which left
+    // the poller dead until process restart (missed New Orders entirely).
+    if (this._running || this._holds > 0) {
+      this._schedule(this._holds > 0 ? Math.min(50, this.intervalMs) : this.intervalMs);
+      return;
+    }
     this._running = true;
     // Bound for portal detection latency: order wasn't present as of the last
     // successful poll start. First tick has no anchor (null is honest).
@@ -228,6 +253,15 @@ export class PortalPoller {
               zip: meta.zip,
               state: meta.state,
               previousPollAt,
+              // Same HTML the poller just fetched — accept/decline can POST
+              // without a duplicate New Orders GET on the hot path.
+              prefetchedPage: {
+                body: page.body,
+                status: page.status,
+                url: page.url,
+                _reauthed: page._reauthed,
+                _otpFetched: page._otpFetched,
+              },
             });
           } catch (e) {
             this.log.error('onOrder handler threw', { err: String(e) });

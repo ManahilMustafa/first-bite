@@ -20,6 +20,11 @@ export class MockPortal {
   constructor({ username = 'vendor1', password = 'pass1', emailLinkMode = 'standalone' } = {}) {
     this.users = new Map([[username, password]]); // username -> password
     this.emailLinkMode = emailLinkMode; // 'standalone' | 'needs_login' | 'needs_login_once' | 'two_step'
+    // Portal list Accept/Decline: 'standalone' = one click settles; 'two_step' =
+    // list click opens the confirmation page (same as the email link), and only
+    // the second Accept/Decline on that page assigns/removes the order.
+    this.portalAcceptMode = 'standalone';
+    this.portalDeclineMode = 'standalone';
     this.orders = new Map(); // id -> { id, status, acceptedBy, address }
     this.sessions = new Map(); // sessionId -> username
     this.issuedViewstate = new Set();
@@ -81,6 +86,8 @@ export class MockPortal {
     this.requests.length = 0;
     this.acceptAttempts.length = 0;
     this.emailOtpRequired = false;
+    this.portalAcceptMode = 'standalone';
+    this.portalDeclineMode = 'standalone';
   }
 
   // ── core: atomic accept ───────────────────────────────────────────────────--
@@ -194,6 +201,9 @@ export class MockPortal {
       const imageTarget = Object.keys(body).find((k) => k.endsWith('.x'))?.slice(0, -2) || '';
       const target = body.__EVENTTARGET || imageTarget;
       const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(target);
+      if (/ShowInProgress|lnkShowInProgress/i.test(target || '')) {
+        return html(res, 200, this._inProgressPage(sessionUser));
+      }
       // Test hook: simulate a rival accepting between this client's GET and POST.
       if (this._onBeforeAccept) {
         const hook = this._onBeforeAccept;
@@ -201,14 +211,28 @@ export class MockPortal {
         hook(orderId);
       }
       if (/decline|reject/i.test(target)) {
+        if (this.portalDeclineMode === 'two_step') {
+          const order = this.orders.get(orderId);
+          if (!order) return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
+          if (order.status === 'accepted')
+            return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+          return html(res, 200, this._orderDetailsPage(orderId, order.address, { acceptLabel: 'Accept Order' }));
+        }
         const d = this._tryDecline(orderId, sessionUser, 'portal');
         if (d.ok) return html(res, 200, this._messagePage(`Order ${orderId} declined.`));
         if (d.reason === 'taken')
           return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
         return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
       }
+      if (this.portalAcceptMode === 'two_step') {
+        const order = this.orders.get(orderId);
+        if (!order) return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
+        if (order.status === 'accepted')
+          return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+        return html(res, 200, this._orderDetailsPage(orderId, order.address, { acceptLabel: 'Accept Appraisal' }));
+      }
       const r = this._tryAccept(orderId, sessionUser, 'portal');
-      if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
+      if (r.ok) return html(res, 200, this._acceptSuccessPage(orderId));
       if (r.reason === 'taken')
         return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
       return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
@@ -233,10 +257,10 @@ export class MockPortal {
         if (order.status === 'accepted') {
           return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
         }
-        return html(res, 200, this._orderDetailsPage(id, order.address));
+        return html(res, 200, this._orderDetailsPage(id, order.address, { acceptLabel: 'Accept Order' }));
       }
       const r = this._tryAccept(id, rec.user, 'email');
-      if (r.ok) return html(res, 200, this._messagePage(`Order ${id} accepted. Thank you.`));
+      if (r.ok) return html(res, 200, this._acceptSuccessPage(id));
       if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${id} not found.`));
     }
@@ -245,11 +269,16 @@ export class MockPortal {
       if (!this.issuedViewstate.has(body.__VIEWSTATE) || !this.issuedEventval.has(body.__EVENTVALIDATION)) {
         return html(res, 200, this._messagePage('Your session has expired. Please refresh.'));
       }
-      const orderId = body.__EVENTARGUMENT || extractOrderFromTarget(body.__EVENTTARGET);
+      const imageTarget = Object.keys(body).find((k) => k.endsWith('.x'))?.slice(0, -2) || '';
+      const target = body.__EVENTTARGET || imageTarget || Object.keys(body).find((k) => /accept/i.test(k)) || '';
+      const orderId =
+        body.__EVENTARGUMENT || extractOrderFromTarget(target) || extractOrderFromTarget(JSON.stringify(body));
+      // Prefer email-token vendor, then the logged-in session (portal two-step confirm).
       const rec = this.orderTokens.get(orderId);
-      const who = rec?.user || 'email';
-      const r = this._tryAccept(orderId, who, 'email_two_step');
-      if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} accepted. Assigned to you.`));
+      const who = rec?.user || sessionUser || 'email';
+      const via = sessionUser && !rec ? 'portal_two_step' : 'email_two_step';
+      const r = this._tryAccept(orderId, who, via);
+      if (r.ok) return html(res, 200, this._acceptSuccessPage(orderId));
       if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
     }
@@ -269,6 +298,22 @@ export class MockPortal {
       if (r.ok) return html(res, 200, this._messagePage(`Order ${id} declined. Thank you.`));
       if (r.reason === 'taken') return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${id} not found.`));
+    }
+    // Confirmation-page Decline POST (email two-step or portal list → details).
+    if (path === '/decline.aspx' && req.method === 'POST') {
+      if (!authed) return redirectToLogin(res);
+      const body = await readForm(req);
+      if (!this.issuedViewstate.has(body.__VIEWSTATE) || !this.issuedEventval.has(body.__EVENTVALIDATION)) {
+        return html(res, 200, this._messagePage('Your session has expired. Please refresh.'));
+      }
+      const target = body.__EVENTTARGET || Object.keys(body).find((k) => /decline|reject/i.test(k)) || '';
+      const orderId =
+        body.__EVENTARGUMENT || extractOrderFromTarget(target) || extractOrderFromTarget(JSON.stringify(body));
+      const r = this._tryDecline(orderId, sessionUser || 'email', sessionUser ? 'portal_two_step' : 'email_two_step');
+      if (r.ok) return html(res, 200, this._messagePage(`Order ${orderId} declined.`));
+      if (r.reason === 'taken')
+        return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+      return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
     }
 
     // Status page (verifier)
@@ -375,16 +420,45 @@ export class MockPortal {
       <div id="message">${msg}</div></body></html>`;
   }
 
-  /** Order details page shown after clicking ACCEPT ORDER in email (step 1 of 2). */
-  _orderDetailsPage(orderId, address = '123 Test St') {
-    return `<!DOCTYPE html><html><head><title>Order ${orderId}</title></head><body>
-      <h1>Order Details</h1>
+  _inProgressPage(sessionUser) {
+    const mine = [...this.orders.values()].filter((o) => o.status === 'accepted' && o.acceptedBy === sessionUser);
+    const rows = mine
+      .map(
+        (o) => `<tr><td>Order no. ${o.id}</td><td>${o.address}</td><td>Accepted by Vendor</td><td>In Progress</td></tr>`
+      )
+      .join('\n');
+    return `<!DOCTYPE html><html><head><title>In Progress Orders - E-Street</title></head><body>
+      <h1>In Progress Orders</h1>
+      <form method="post" action="/AppraiserDashboard.aspx">${this._stateFields()}
+      <table>${rows || '<tr><td>No orders in progress.</td></tr>'}</table>
+      </form></body></html>`;
+  }
+
+  /** Post-accept success — models the green badge the Gmail path shows. */
+  _acceptSuccessPage(orderId) {
+    return `<!DOCTYPE html><html><head><title>E-Street</title></head><body>
+      <div class="alert alert-success badge-success">You have successfully accepted this order.</div>
+      <div id="message">Order ${orderId} accepted. Assigned to you.</div>
+    </body></html>`;
+  }
+
+  /**
+   * Confirmation / order-details page — same UI whether the vendor arrived via
+   * the email Accept/Decline link or via a New Orders list tick (step 1 of 2).
+   * Gmail path uses "Accept Order"; portal path uses "Accept Appraisal".
+   */
+  _orderDetailsPage(orderId, address = '123 Test St', { acceptLabel = 'Accept Order' } = {}) {
+    return `<!DOCTYPE html><html><head><title>ACCEPT ORDER</title></head><body>
+      <h1>ACCEPT ORDER</h1>
       <p>Order no. ${orderId}</p>
       <p>Property Address: ${address}</p>
       <form method="post" action="/accept.aspx">
         ${this._stateFields()}
-        <input type="submit" name="ctl00$MainContent$btnAccept" value="Accept" style="color:green" />
-        <a href="javascript:__doPostBack('ctl00$MainContent$btnAccept','${orderId}')">Accept</a>
+        <input type="hidden" name="__EVENTARGUMENT" value="${orderId}" />
+        <input type="submit" name="ctl00$MainContent$btnAccept" value="${acceptLabel}" style="color:green" />
+        <a href="javascript:__doPostBack('ctl00$MainContent$btnAccept','${orderId}')">${acceptLabel}</a>
+        <input type="submit" name="ctl00$MainContent$btnDecline" value="Decline" formaction="/decline.aspx" />
+        <a href="javascript:__doPostBack('ctl00$MainContent$btnDecline','${orderId}')">Decline</a>
       </form></body></html>`;
   }
 }

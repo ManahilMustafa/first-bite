@@ -77,12 +77,13 @@ export class HttpClient {
    * Perform a single request WITHOUT following redirects.
    * Returns { status, headers, body, location, redirected:false, durationMs }.
    */
-  request(urlStr, { method = 'GET', headers = {}, body, followRedirects = false } = {}) {
+  request(urlStr, { method = 'GET', headers = {}, body, followRedirects = false, timeoutMs } = {}) {
     const startedAt = process.hrtime.bigint();
     const u = new URL(urlStr);
     const isHttps = u.protocol === 'https:';
     const lib = isHttps ? https : http;
     const agent = isHttps ? this.httpsAgent : this.httpAgent;
+    const reqTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.timeoutMs;
 
     const cookieHeader = this.jar.header(u.host);
     const reqHeaders = { ...this.defaultHeaders, ...headers };
@@ -124,6 +125,9 @@ export class HttpClient {
               durationMs,
             };
             // Optionally chase one redirect chain (kept explicit & shallow).
+            // Browsers treat 301/302/303 after POST as GET to the Location
+            // (ASP.NET Error.aspx / login redirects rely on this). Re-POSTing
+            // the body to Error.aspx is wrong and masks the real outcome.
             if (
               followRedirects &&
               [301, 302, 303, 307, 308].includes(res.statusCode) &&
@@ -131,14 +135,25 @@ export class HttpClient {
             ) {
               try {
                 const next = new URL(result.location, urlStr).toString();
-                const nextMethod = res.statusCode === 303 ? 'GET' : method;
+                const forceGet =
+                  method !== 'GET' &&
+                  method !== 'HEAD' &&
+                  (res.statusCode === 303 || res.statusCode === 302 || res.statusCode === 301);
+                const nextMethod = forceGet ? 'GET' : method;
                 const r2 = await this.request(next, {
                   method: nextMethod,
                   headers,
-                  body: nextMethod === 'GET' ? undefined : body,
-                  followRedirects, // allow chaining (bounded by maxRedirects below)
+                  body: nextMethod === 'GET' || nextMethod === 'HEAD' ? undefined : body,
+                  followRedirects,
+                  timeoutMs: reqTimeoutMs,
                 });
-                return resolve({ ...r2, redirected: true, redirectedFrom: urlStr });
+                return resolve({
+                  ...r2,
+                  redirected: true,
+                  redirectedFrom: urlStr,
+                  // Prefer total time across the hop when available.
+                  durationMs: (result.durationMs || 0) + (r2.durationMs || 0),
+                });
               } catch (e) {
                 return reject(e);
               }
@@ -147,7 +162,7 @@ export class HttpClient {
           });
         }
       );
-      req.setTimeout(this.timeoutMs, () => req.destroy(new Error(`Request timeout: ${urlStr}`)));
+      req.setTimeout(reqTimeoutMs, () => req.destroy(new Error(`Request timeout: ${urlStr}`)));
       req.on('error', reject);
       if (payload != null) req.write(payload);
       req.end();

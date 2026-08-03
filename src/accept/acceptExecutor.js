@@ -1,14 +1,9 @@
 // Accept executor — the hot path.
 //
-// Given a detected order, RACE the two accept strategies and take whichever
-// confirms first:
-//   Path A: email-link GET (fast, if self-contained)
-//   Path B: portal __doPostBack replay (robust)
-// Then verify by re-reading order status (off the critical path for latency,
-// but still awaited so we report a truthful outcome).
-//
-// Exactly-once is enforced one layer up by the lock; this module assumes it has
-// already won the lock for `orderId`.
+// Race Path A (email) vs Path B (portal), then confirm against the portal.
+// Dashboard "Accepted" is driven by result.accepted — that flag must only be
+// true when we have real portal proof (or a hard path success that verify
+// corroborates). Soft/optimistic wins never become accepted:true alone.
 import { acceptViaEmailLink } from './emailAccept.js';
 import { acceptViaPortal } from './portalAccept.js';
 import { tagResult, firstSuccessOrAll } from './race.js';
@@ -17,13 +12,14 @@ import { logger } from '../util/logger.js';
 /**
  * @param {object} opts
  * @param {string} opts.orderId
- * @param {string} [opts.acceptUrl]                 email ACCEPT link (enables Path A)
- * @param {import('../portal/session.js').PortalSession} [opts.session]  enables Path B + verify
- * @param {object} [opts.portalOpts]                passed to acceptViaPortal
+ * @param {string} [opts.acceptUrl]
+ * @param {import('../portal/session.js').PortalSession} [opts.session]
+ * @param {object} [opts.portalOpts]
  * @param {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>} [opts.verify]
+ * @param {()=>void} [opts.onAfterRace]  called once accept paths have settled,
+ *        before verify — lets the worker release the poller hold so detection
+ *        continues while verify (reporting only) runs.
  * @param {object} [opts.log]
- * @returns {Promise<{accepted:boolean, via:string|null, outcome:string,
- *                    durationMs:number, paths:object, verified:string|null}>}
  */
 export async function executeAccept({
   orderId,
@@ -31,7 +27,10 @@ export async function executeAccept({
   session,
   portalOpts = {},
   verify,
+  onAfterRace,
   log = logger('accept'),
+  portalAcceptFn = acceptViaPortal,
+  emailAcceptFn = acceptViaEmailLink,
 }) {
   const startedAt = process.hrtime.bigint();
   const tasks = [];
@@ -40,13 +39,13 @@ export async function executeAccept({
     tasks.push(
       tagResult(
         'email',
-        acceptViaEmailLink({ acceptUrl, http: session?.http, session, log: log.child('email') })
+        emailAcceptFn({ acceptUrl, http: session?.http, session, log: log.child('email') })
       )
     );
   }
   if (session) {
     tasks.push(
-      tagResult('portal', acceptViaPortal({ session, orderId, log: log.child('portal'), ...portalOpts }))
+      tagResult('portal', portalAcceptFn({ session, orderId, log: log.child('portal'), ...portalOpts }))
     );
   }
 
@@ -54,41 +53,39 @@ export async function executeAccept({
     return { accepted: false, via: null, outcome: 'no_path', durationMs: 0, paths: {}, verified: null };
   }
 
-  // Race: resolve as soon as ANY path reports a confirmed accept; otherwise wait
-  // for all to settle and pick the best outcome.
   const paths = {};
   const winner = await firstSuccessOrAll(tasks, (name, result) => {
     paths[name] = result;
     return result?.ok === true;
   });
+  // Winner may resolve early; wait for the loser so the session is quiet before
+  // we hand the poller back / start verify.
+  await Promise.all(tasks);
 
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  try {
+    onAfterRace?.();
+  } catch (e) {
+    log.warn('onAfterRace threw', { orderId, err: String(e) });
+  }
 
   let via = null;
   let outcome = 'failed';
   let accepted = false;
+  let optimistic = false;
 
   if (winner?.ok) {
-    accepted = true;
     via = winner.__name;
-    outcome = 'accepted';
+    outcome = winner.outcome || 'accepted';
+    optimistic = outcome === 'submitted';
+    // Provisional only — verify below must allow a dashboard win.
+    accepted = !optimistic;
+    if (!optimistic) outcome = 'accepted';
   } else {
-    // No confirmed success — see if any path says it was taken by someone else.
     const taken = Object.values(paths).some((p) => p?.outcome === 'taken');
     outcome = taken ? 'taken' : (Object.values(paths).find((p) => p?.outcome)?.outcome || 'failed');
   }
 
-  // Verify against source of truth (the portal), if a verifier is given.
-  // Timed separately from the race (durationMs above) so a latency report can
-  // tell "how long did winning take" apart from "how long did confirming it
-  // take" — conflating the two would hide which one is actually the bottleneck.
-  //
-  // CRITICAL: verify must NEVER invent an accept. If every path failed before
-  // clicking anything (not_found / needs_login), a flaky status-page regex used
-  // to flip those into accepted:true / via:'verified' — the dashboard lied while
-  // the portal never got an Accept click. Verify may confirm a real path win,
-  // detect 'taken', or confirm an ambiguous post that actually landed — but not
-  // promote a pure miss into a success.
   let verified = null;
   let verifyDurationMs = 0;
   if (verify) {
@@ -99,11 +96,24 @@ export async function executeAccept({
       const neverActed = Object.values(paths).every(
         (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)
       );
+      const pathHardWin = !!(winner?.ok && winner.outcome === 'accepted');
+
       if (verified === 'taken') {
         accepted = false;
         outcome = 'taken';
+      } else if (verified === 'available') {
+        if (accepted || optimistic) {
+          log.warn('path claimed accept but portal still shows available — not claiming a win', {
+            orderId,
+            paths,
+          });
+        }
+        accepted = false;
+        outcome = 'still_available';
       } else if (verified === 'accepted') {
-        if (accepted || !neverActed) {
+        // Portal confirms assignment. Still refuse if we never clicked anything
+        // (nav-regex lies on an empty status page).
+        if (pathHardWin || optimistic || accepted || !neverActed) {
           accepted = true;
           outcome = 'accepted';
           via = via || 'verified';
@@ -112,10 +122,32 @@ export async function executeAccept({
             orderId,
             paths,
           });
+          accepted = false;
+        }
+      } else {
+        // verified === 'unknown' (or unexpected): do NOT trust path-only for the
+        // dashboard. Soft wins and hard path text without portal corroboration
+        // become unverified — Orders page stays Failed/Pending, not Accepted.
+        if (accepted || optimistic) {
+          log.warn('accept not portal-confirmed — not marking dashboard Accepted', {
+            orderId,
+            verified,
+            pathOutcome: winner?.outcome,
+            steps: winner?.steps,
+          });
+        }
+        accepted = false;
+        if (optimistic || pathHardWin || outcome === 'accepted') {
+          outcome = 'unverified';
         }
       }
     } catch (e) {
       log.warn('verify failed', { orderId, err: String(e) });
+      // Verify threw — cannot honestly claim Accepted.
+      if (accepted || optimistic) {
+        accepted = false;
+        outcome = 'unverified';
+      }
     } finally {
       verifyDurationMs = Number(process.hrtime.bigint() - verifyStartedAt) / 1e6;
     }
@@ -132,8 +164,6 @@ export async function executeAccept({
       verified,
     });
   } else {
-    // Never let a failure disappear into a one-line summary: dump every path's
-    // exact status/response so the real cause is debuggable without re-running.
     log.error('accept result: FAILED', {
       orderId,
       accepted,

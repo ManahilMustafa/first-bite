@@ -1,0 +1,1594 @@
+===CAT_acceptExecutor===
+// Accept executor — the hot path.
+//
+// Race Path A (email) vs Path B (portal), then confirm against the portal.
+// Dashboard "Accepted" is driven by result.accepted — that flag must only be
+// true when we have real portal proof (or a hard path success that verify
+// corroborates). Soft/optimistic wins never become accepted:true alone.
+import { acceptViaEmailLink } from './emailAccept.js';
+import { acceptViaPortal } from './portalAccept.js';
+import { tagResult, firstSuccessOrAll } from './race.js';
+import { logger } from '../util/logger.js';
+
+/**
+ * @param {object} opts
+ * @param {string} opts.orderId
+ * @param {string} [opts.acceptUrl]
+ * @param {import('../portal/session.js').PortalSession} [opts.session]
+ * @param {object} [opts.portalOpts]
+ * @param {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>} [opts.verify]
+ * @param {()=>void} [opts.onAfterRace]  called once accept paths have settled,
+ *        before verify — lets the worker release the poller hold so detection
+ *        continues while verify (reporting only) runs.
+ * @param {object} [opts.log]
+ */
+export async function executeAccept({
+  orderId,
+  acceptUrl,
+  session,
+  portalOpts = {},
+  verify,
+  onAfterRace,
+  log = logger('accept'),
+  portalAcceptFn = acceptViaPortal,
+  emailAcceptFn = acceptViaEmailLink,
+}) {
+  const startedAt = process.hrtime.bigint();
+  const tasks = [];
+
+  if (acceptUrl) {
+    tasks.push(
+      tagResult(
+        'email',
+        emailAcceptFn({ acceptUrl, http: session?.http, session, log: log.child('email') })
+      )
+    );
+  }
+  if (session) {
+    tasks.push(
+      tagResult('portal', portalAcceptFn({ session, orderId, log: log.child('portal'), ...portalOpts }))
+    );
+  }
+
+  if (tasks.length === 0) {
+    return { accepted: false, via: null, outcome: 'no_path', durationMs: 0, paths: {}, verified: null };
+  }
+
+  const paths = {};
+  const winner = await firstSuccessOrAll(tasks, (name, result) => {
+    paths[name] = result;
+    return result?.ok === true;
+  });
+  // Winner may resolve early; wait for the loser so the session is quiet before
+  // we hand the poller back / start verify.
+  await Promise.all(tasks);
+
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  try {
+    onAfterRace?.();
+  } catch (e) {
+    log.warn('onAfterRace threw', { orderId, err: String(e) });
+  }
+
+  let via = null;
+  let outcome = 'failed';
+  let accepted = false;
+  let optimistic = false;
+
+  if (winner?.ok) {
+    via = winner.__name;
+    outcome = winner.outcome || 'accepted';
+    optimistic = outcome === 'submitted';
+    // Provisional only — verify below must allow a dashboard win.
+    accepted = !optimistic;
+    if (!optimistic) outcome = 'accepted';
+  } else {
+    const taken = Object.values(paths).some((p) => p?.outcome === 'taken');
+    outcome = taken ? 'taken' : (Object.values(paths).find((p) => p?.outcome)?.outcome || 'failed');
+  }
+
+  let verified = null;
+  let verifyDurationMs = 0;
+  if (verify) {
+    const verifyStartedAt = process.hrtime.bigint();
+    try {
+      verified = await verify(orderId);
+      log.info('final portal confirmation', { orderId, verified });
+      const neverActed = Object.values(paths).every(
+        (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)
+      );
+      const pathHardWin = !!(winner?.ok && winner.outcome === 'accepted');
+
+      if (verified === 'taken') {
+        accepted = false;
+        outcome = 'taken';
+      } else if (verified === 'available') {
+        if (accepted || optimistic) {
+          log.warn('path claimed accept but portal still shows available — not claiming a win', {
+            orderId,
+            paths,
+          });
+        }
+        accepted = false;
+        outcome = 'still_available';
+      } else if (verified === 'accepted') {
+        // Portal confirms assignment. Still refuse if we never clicked anything
+        // (nav-regex lies on an empty status page).
+        if (pathHardWin || optimistic || accepted || !neverActed) {
+          accepted = true;
+          outcome = 'accepted';
+          via = via || 'verified';
+        } else {
+          log.warn('verify said accepted but no accept path acted — not claiming a win', {
+            orderId,
+            paths,
+          });
+          accepted = false;
+        }
+      } else {
+        // verified === 'unknown' (or unexpected): do NOT trust path-only for the
+        // dashboard. Soft wins and hard path text without portal corroboration
+        // become unverified — Orders page stays Failed/Pending, not Accepted.
+        if (accepted || optimistic) {
+          log.warn('accept not portal-confirmed — not marking dashboard Accepted', {
+            orderId,
+            verified,
+            pathOutcome: winner?.outcome,
+            steps: winner?.steps,
+          });
+        }
+        accepted = false;
+        if (optimistic || pathHardWin || outcome === 'accepted') {
+          outcome = 'unverified';
+        }
+      }
+    } catch (e) {
+      log.warn('verify failed', { orderId, err: String(e) });
+      // Verify threw — cannot honestly claim Accepted.
+      if (accepted || optimistic) {
+        accepted = false;
+        outcome = 'unverified';
+      }
+    } finally {
+      verifyDurationMs = Number(process.hrtime.bigint() - verifyStartedAt) / 1e6;
+    }
+  }
+
+  if (accepted) {
+    log.info('accept result', {
+      orderId,
+      accepted,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+    });
+  } else {
+    log.error('accept result: FAILED', {
+      orderId,
+      accepted,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+      paths,
+    });
+  }
+  return { accepted, via, outcome, durationMs, verifyDurationMs, paths, verified };
+}
+
+export default executeAccept;
+===CAT_declineExecutor===
+// Decline executor — the out-of-region path.
+//
+// Given a detected order that fails the user's region filter, RACE the two
+// decline strategies and take whichever confirms first:
+//   Path A: email DECLINE-link GET (fast, if self-contained)
+//   Path B: portal __doPostBack replay (robust; works for poller-detected orders)
+// Then verify by re-reading order status: a decline succeeded as long as the
+// order is no longer 'accepted' (assigned to us).
+//
+// Exactly-once is enforced one layer up by the lock; this assumes it has already
+// won the lock for `orderId`.
+import { declineViaEmailLink } from './emailDecline.js';
+import { declineViaPortal } from './portalDecline.js';
+import { tagResult, firstSuccessOrAll } from './race.js';
+import { logger } from '../util/logger.js';
+
+/**
+ * @param {object} opts
+ * @param {string} opts.orderId
+ * @param {string} [opts.declineUrl]                email DECLINE link (enables Path A)
+ * @param {import('../portal/session.js').PortalSession} [opts.session] enables Path B + verify
+ * @param {object} [opts.portalOpts]                passed to declineViaPortal
+ * @param {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>} [opts.verify]
+ * @param {()=>void} [opts.onAfterRace]  see acceptExecutor — release poller before verify
+ * @param {object} [opts.log]
+ * @returns {Promise<{declined:boolean, via:string|null, outcome:string,
+ *                    durationMs:number, paths:object, verified:string|null}>}
+ */
+export async function executeDecline({
+  orderId,
+  declineUrl,
+  session,
+  portalOpts = {},
+  verify,
+  onAfterRace,
+  log = logger('decline'),
+}) {
+  const startedAt = process.hrtime.bigint();
+  const tasks = [];
+
+  if (declineUrl) {
+    tasks.push(
+      tagResult(
+        'email',
+        declineViaEmailLink({ declineUrl, http: session?.http, session, log: log.child('email') })
+      )
+    );
+  }
+  if (session) {
+    tasks.push(
+      tagResult('portal', declineViaPortal({ session, orderId, log: log.child('portal'), ...portalOpts }))
+    );
+  }
+
+  if (tasks.length === 0) {
+    return { declined: false, via: null, outcome: 'no_path', durationMs: 0, paths: {}, verified: null };
+  }
+
+  const paths = {};
+  const winner = await firstSuccessOrAll(tasks, (name, result) => {
+    paths[name] = result;
+    return result?.ok === true;
+  });
+  await Promise.all(tasks);
+
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  try {
+    onAfterRace?.();
+  } catch (e) {
+    log.warn('onAfterRace threw', { orderId, err: String(e) });
+  }
+
+  let via = null;
+  let outcome = 'failed';
+  let declined = false;
+  // 'submitted' means a path got a 2xx but no explicit "declined"/"gone" text —
+  // optimistic, NOT proof. Such a win must be confirmed by verify before we claim
+  // success; an explicit 'declined'/'gone' stands on its own.
+  let optimistic = false;
+
+  if (winner?.ok) {
+    via = winner.__name;
+    outcome = winner.outcome || 'declined';
+    optimistic = outcome === 'submitted';
+    declined = !optimistic; // confirmed wins count immediately; optimistic awaits verify
+  } else {
+    outcome = Object.values(paths).find((p) => p?.outcome)?.outcome || 'failed';
+  }
+
+  // Verify against source of truth: a decline is good as long as the order is no
+  // longer assigned to us. Only 'accepted' contradicts a successful decline.
+  // Same honesty rule as accept: never invent a decline when every path failed
+  // before clicking (not_found / needs_login) — "still available" on the status
+  // page is NOT proof we declined it.
+  let verified = null;
+  let verifyDurationMs = 0;
+  if (verify) {
+    const verifyStartedAt = process.hrtime.bigint();
+    try {
+      verified = await verify(orderId);
+      log.info('final portal confirmation', { orderId, verified });
+      const neverActed = Object.values(paths).every(
+        (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)
+      );
+      if (verified === 'accepted') {
+        declined = false;
+        outcome = 'still_assigned';
+      } else if (verified === 'available' || verified === 'taken') {
+        if (declined || !neverActed) {
+          declined = true;
+          if (outcome === 'failed' || outcome === 'submitted') {
+            outcome = verified === 'taken' ? 'gone' : 'declined';
+            via = via || 'verified';
+          }
+        } else {
+          log.warn('verify said order gone/available but no decline path acted — not claiming a decline', {
+            orderId,
+            verified,
+            paths,
+          });
+        }
+      }
+    } catch (e) {
+      log.warn('decline verify failed', { orderId, err: String(e) });
+    } finally {
+      verifyDurationMs = Number(process.hrtime.bigint() - verifyStartedAt) / 1e6;
+    }
+  }
+
+  // An optimistic 'submitted' that verify could not confirm is NOT a success —
+  // reporting declined:true here would lie about an order that may still be ours.
+  // (If verify said 'accepted', outcome is already the truthful 'still_assigned'.)
+  if (optimistic && !declined && (verified === null || verified === 'unknown')) {
+    outcome = 'unverified';
+  }
+
+  if (declined) {
+    log.info('decline result', {
+      orderId,
+      declined,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+    });
+  } else {
+    log.error('decline result: FAILED', {
+      orderId,
+      declined,
+      via,
+      outcome,
+      ms: Math.round(durationMs),
+      verifyMs: Math.round(verifyDurationMs),
+      verified,
+      paths,
+    });
+  }
+  return { declined, via, outcome, durationMs, verifyDurationMs, paths, verified };
+}
+
+export default executeDecline;
+===CAT_portalAccept===
+// Path B — accept via the portal by replaying the WebForms __doPostBack.
+//
+// Real E-Street portal flow (owner-confirmed):
+//   1. GET New Orders → green tick (image Accept) for the order row.
+//   2. Confirmation page (AcceptAppraisal / AcceptBroadcastAppraisal) with
+//      green "Accept Appraisal" button → POST that.
+//   3. Loading, then order detail / in-progress (no alert popup).
+import { writeFile } from 'node:fs/promises';
+import {
+  buildControlClick,
+  findPostbackTarget,
+  looksLikeLogin,
+  looksLikeStaleState,
+  scrapeFormActionForControl,
+} from '../portal/aspnet.js';
+import { logger } from '../util/logger.js';
+import { snippet } from '../portal/session.js';
+import { dumpAcceptDiagnostic } from './diagnostic.js';
+import {
+  findConfirmAcceptControl,
+  isAcceptConfirmUrl,
+  looksAccepted,
+  looksLikePortalError,
+  looksTaken,
+} from './signals.js';
+
+/**
+ * @param {object} opts
+ * @param {import('../portal/session.js').PortalSession} opts.session
+ * @param {string} opts.orderId
+ * @param {string} [opts.newOrdersPath]
+ * @param {RegExp} [opts.acceptLabel]  list-row Accept locator (default /accept/i)
+ * @param {(html:string, orderId:string)=>({target:string,argument?:string,extra?:object}|null)} [opts.locateAccept]
+ * @param {object} [opts.log]
+ * @param {boolean} [opts.reuseCachedPage]
+ * @param {number} [opts.cacheMaxAgeMs]
+ * @param {{body:string, status?:number, url?:string, _reauthed?:boolean, _otpFetched?:boolean}} [opts.prefetchedPage]
+ *        New Orders page already fetched on the accept session (overlaps region/lock).
+ */
+export async function acceptViaPortal({
+  session,
+  orderId,
+  newOrdersPath,
+  acceptLabel = /accept/i,
+  locateAccept,
+  log = logger('accept:portal'),
+  reuseCachedPage = false,
+  cacheMaxAgeMs = 3000,
+  prefetchedPage = null,
+}) {
+  const path = newOrdersPath || session.routes.newOrders;
+  log.info('accept attempt', { orderId });
+
+  const locate = (html) => (locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, acceptLabel));
+
+  if (prefetchedPage?.body && prefetchedPage.body.includes(orderId)) {
+    log.info('accept: using prefetched New Orders page (skipping GET)', { orderId });
+    const result = await attempt(prefetchedPage, { fromCache: true });
+    if (result) return result;
+    log.warn('accept: prefetched page rejected/unusable — falling back', { orderId });
+  }
+
+  const cached = reuseCachedPage ? session.getCachedPage(path, cacheMaxAgeMs) : null;
+  if (cached && cached.body.includes(orderId)) {
+    log.info('accept: reusing recently polled page (skipping fresh GET)', { orderId, ageMs: Date.now() - cached.ts });
+    const result = await attempt(cached, { fromCache: true });
+    if (result) return result;
+    log.warn('accept: cached page rejected/unusable — falling back to a fresh GET', { orderId });
+  }
+
+  const page = await session.authedGet(path);
+  const result = await attempt(page, { fromCache: false });
+  if (result) return result;
+  log.warn('accept: no accept control found for order', { orderId });
+  return {
+    ok: false,
+    outcome: 'not_found',
+    reason: `no accept control for order ${orderId}`,
+    reauthed: !!page._reauthed,
+    otpFetched: !!page._otpFetched,
+  };
+
+  async function attempt(pageData, { fromCache }) {
+    const html = pageData.body;
+    const reauthed = !!pageData._reauthed;
+    const otpFetched = !!pageData._otpFetched;
+
+    if (looksLikeLogin(html)) {
+      if (fromCache) return null;
+      log.error('accept failed: still redirected to login after retry', {
+        orderId,
+        status: pageData.status,
+        bodySnippet: snippet(html),
+      });
+      return { ok: false, outcome: 'needs_login', status: pageData.status, bodySnippet: snippet(html), reauthed, otpFetched };
+    }
+
+    const pb = locate(html);
+    if (!pb) {
+      if (fromCache) return null;
+      writeFile('/root/Estreet/data/dashboard-diagnostic.html', html, 'utf8').catch(() => {});
+      return null;
+    }
+
+    const body = buildControlClick(html, pb);
+
+    const listUrl = typeof session.url === 'function' ? session.url(path) : path;
+    const res = await session.authedPost(path, body, {
+      headers: { referer: listUrl },
+    });
+    let resp = res.body || '';
+    let status = res.status;
+    let durationMs = res.durationMs || 0;
+    let nowReauthed = reauthed || !!res._reauthed;
+    let nowOtp = otpFetched || !!res._otpFetched;
+    let usedDetailsStep = false;
+    let pageUrl = res.url || (typeof session.url === 'function' ? session.url(path) : path);
+
+    if (looksLikeLogin(resp)) {
+      if (fromCache) return null;
+      log.error('accept failed: postback still redirected to login after retry', {
+        orderId,
+        status,
+        bodySnippet: snippet(resp),
+      });
+      return {
+        ok: false,
+        outcome: 'needs_login',
+        status,
+        durationMs,
+        bodySnippet: snippet(resp),
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+      };
+    }
+    if (fromCache && looksLikeStaleState(resp)) return null;
+
+    if (looksTaken(resp)) {
+      return { ok: false, outcome: 'taken', status, durationMs, reauthed: nowReauthed, otpFetched: nowOtp };
+    }
+    if (looksAccepted(resp)) {
+      log.info('accept successful', { orderId, via: 'portal', usedCachedPage: fromCache, steps: ['list_postback'] });
+      return { ok: true, outcome: 'accepted', status, durationMs, reauthed: nowReauthed, otpFetched: nowOtp, steps: ['list_postback'] };
+    }
+
+    // Step 2: confirmation page — prefer "Accept Appraisal".
+    const detailsPb = findDetailsAccept(resp, orderId, pageUrl, locateAccept);
+    if (detailsPb) {
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_confirm_page', html: resp, url: pageUrl });
+      const postUrl = scrapeFormActionForControl(resp, pageUrl, detailsPb.target);
+      if (/&amp;/i.test(postUrl)) {
+        log.error('accept: form action still contains &amp; after decode — refusing POST', {
+          orderId,
+          postUrl,
+        });
+        return {
+          ok: false,
+          outcome: 'bad_url',
+          reason: 'form action retained &amp; entity',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: ['list_postback'],
+        };
+      }
+      const detailsBody = buildControlClick(resp, detailsPb);
+      const absPostUrl =
+        typeof session.url === 'function' && !/^https?:/i.test(postUrl)
+          ? session.url(postUrl)
+          : postUrl;
+      // Confirm URL already carries Accept=asis (same shape as the email link).
+      // Race a cookie'd GET against the WebForms POST — whichever settles with a
+      // decisive outcome first wins. The slow ~5–6s losses we saw were waiting
+      // only on the heavy postback+278KB Order page.
+      log.info('accept: confirmation page — racing Accept=asis GET + Appraisal POST', {
+        orderId,
+        postUrl: absPostUrl,
+      });
+
+      const detailsStarted = process.hrtime.bigint();
+      const second = await raceConfirmAccept({
+        session,
+        absPostUrl,
+        postUrl,
+        detailsBody,
+        referer: pageUrl,
+        orderId,
+        log,
+      });
+      const detailsMs = Number(process.hrtime.bigint() - detailsStarted) / 1e6;
+      resp = second.body || '';
+      status = second.status;
+      durationMs = (durationMs || 0) + (second.durationMs || detailsMs);
+      nowReauthed = nowReauthed || !!second._reauthed;
+      nowOtp = nowOtp || !!second._otpFetched;
+      usedDetailsStep = true;
+      pageUrl = second.url || absPostUrl;
+      const detailSteps = ['list_postback', second.via || 'details_postback'];
+
+      if (looksLikeLogin(resp)) {
+        if (fromCache) return null;
+        log.error('accept failed: details Accept redirected to login after retry', {
+          orderId,
+          status,
+          bodySnippet: snippet(resp),
+        });
+        return {
+          ok: false,
+          outcome: 'needs_login',
+          status,
+          durationMs,
+          bodySnippet: snippet(resp),
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        };
+      }
+      if (looksLikePortalError(resp, pageUrl)) {
+        dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept_error', html: resp, url: pageUrl });
+        log.error('accept failed: portal returned Error.aspx after Accept Appraisal', {
+          orderId,
+          status,
+          pageUrl,
+          bodySnippet: snippet(resp),
+        });
+        return {
+          ok: false,
+          outcome: 'portal_error',
+          status,
+          durationMs,
+          bodySnippet: snippet(resp),
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        };
+      }
+      if (looksTaken(resp)) {
+        dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept_taken', html: resp, url: pageUrl });
+        return {
+          ok: false,
+          outcome: 'taken',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        };
+      }
+      if (looksAccepted(resp)) {
+        log.info('accept successful', {
+          orderId,
+          via: 'portal',
+          usedCachedPage: fromCache,
+          confirmVia: second.via,
+          steps: detailSteps,
+        });
+        return {
+          ok: true,
+          outcome: 'accepted',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        };
+      }
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept', html: resp, url: pageUrl });
+    } else if (isAcceptConfirmUrl(pageUrl) || /ACCEPT\s+(APPRAISAL\s+)?ORDER/i.test(resp)) {
+      // Landed on confirm UI but could not locate the button — capture HTML.
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_confirm_no_btn', html: resp, url: pageUrl });
+    }
+
+    const steps = usedDetailsStep ? ['list_postback', 'details_postback'] : ['list_postback'];
+
+    // Error.aspx has no order id either — never treat it as an optimistic submit.
+    if (looksLikePortalError(resp, pageUrl)) {
+      log.error('accept failed: portal error page (not a successful submit)', {
+        orderId,
+        status,
+        pageUrl,
+        steps,
+      });
+      return {
+        ok: false,
+        outcome: 'portal_error',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps,
+      };
+    }
+
+    if (status >= 200 && status < 300 && orderId && !resp.includes(orderId)) {
+      log.info('accept postback removed order from list — pending verify', {
+        orderId,
+        via: 'portal',
+        usedCachedPage: fromCache,
+        steps,
+      });
+      return {
+        ok: true,
+        outcome: 'submitted',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps,
+      };
+    }
+    if (fromCache) return null;
+    log.error('accept failed: unrecognized postback response', { orderId, status, bodySnippet: snippet(resp), steps });
+    return {
+      ok: false,
+      outcome: 'unknown',
+      status,
+      durationMs,
+      bodySnippet: snippet(resp),
+      reauthed: nowReauthed,
+      otpFetched: nowOtp,
+      steps,
+    };
+  }
+}
+
+/**
+ * Race cookie'd GET (URL already has Accept=asis) vs WebForms Accept Appraisal POST.
+ * First decisive response wins; otherwise prefer the POST result.
+ */
+async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log }) {
+  const headers = { referer };
+
+  const wrap = async (via, promise) => {
+    try {
+      const r = await promise;
+      return { ...r, via, _ok: true };
+    } catch (e) {
+      log.warn('confirm accept path error', { via, orderId, err: String(e) });
+      return { status: 0, body: '', durationMs: 0, via, _ok: false, error: String(e) };
+    }
+  };
+
+  const isDecisive = (r) => {
+    if (!r || r._ok === false) return false;
+    const body = r.body || '';
+    const url = r.url || absPostUrl;
+    if (looksLikeLogin(body)) return true;
+    if (looksLikePortalError(body, url)) return true;
+    if (looksTaken(body)) return true;
+    if (looksAccepted(body)) return true;
+    // Confirm UI still showing Accept Appraisal → GET alone did not finish.
+    if (findConfirmAcceptControl(body, 'appraisal')) return false;
+    if (r.status >= 200 && r.status < 300 && orderId && body && !body.includes(orderId)) return true;
+    return false;
+  };
+
+  const getP = wrap(
+    'details_get',
+    session.http.get(absPostUrl, { followRedirects: true, headers })
+  );
+  const postP = wrap(
+    'details_postback',
+    session.authedPost(postUrl, detailsBody, { headers })
+  );
+
+  return new Promise((resolve) => {
+    let remaining = 2;
+    /** @type {object[]} */
+    const settled = [];
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      resolve(r);
+    };
+    const onSettle = (r) => {
+      settled.push(r);
+      if (isDecisive(r)) {
+        log.info('confirm accept path settled first', { orderId, via: r.via, status: r.status });
+        return finish(r);
+      }
+      if (--remaining === 0) {
+        finish(settled.find((x) => x.via === 'details_postback') || settled[0]);
+      }
+    };
+    getP.then(onSettle);
+    postP.then(onSettle);
+  });
+}
+
+/**
+ * Confirmation-page Accept: prefer Accept Appraisal; never re-click list tick.
+ */
+function findDetailsAccept(html, orderId, pageUrl, locateAccept) {
+  if (!html) return null;
+  const onConfirmUrl = isAcceptConfirmUrl(pageUrl);
+  if (orderId && html.includes(orderId) && /imgBtnBroadcastAccept|grdNewOrders/i.test(html) && !onConfirmUrl) {
+    const listPb = locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, /accept/i);
+    if (listPb && /BroadcastAccept|grdNewOrders/i.test(listPb.target || '')) return null;
+  }
+
+  const preferred = findConfirmAcceptControl(html, 'appraisal');
+  if (preferred) return preferred;
+
+  if (locateAccept) {
+    const scoped = locateAccept(html, orderId);
+    if (scoped) return scoped;
+  }
+  const scoped = locateAcceptForOrder(html, orderId, /accept/i);
+  if (scoped) return scoped;
+  return findPostbackTarget(html, /accept/i);
+}
+
+export function locateAcceptForOrder(html, orderId, acceptLabel = /accept/i) {
+  if (orderId) {
+    const idx = html.indexOf(orderId);
+    if (idx === -1) return null;
+    const local = findPostbackTarget(html.slice(idx, idx + 4000), acceptLabel);
+    if (local) return local;
+    return findPostbackTarget(html.slice(Math.max(0, idx - 2000), idx + 4000), acceptLabel);
+  }
+  return findPostbackTarget(html, acceptLabel);
+}
+
+export default acceptViaPortal;
+===CAT_portalDecline===
+// Decline Path B — decline via the portal by replaying the WebForms __doPostBack.
+//
+// Mirrors portalAccept.js, including the real E-Street two-step:
+//   1. GET New Orders → locate Decline for this order → POST list click.
+//   2. Confirmation / details page (same as email Decline link) → POST Decline
+//      again. One-step portals that confirm on step 1 still short-circuit.
+import {
+  buildControlClick,
+  findPostbackTarget,
+  looksLikeLogin,
+  looksLikeStaleState,
+  scrapeFormActionForControl,
+} from '../portal/aspnet.js';
+import { logger } from '../util/logger.js';
+import { snippet } from '../portal/session.js';
+
+const DECLINED_RE = /declined|rejected|order declined|has been declined|removed from your/i;
+const GONE_RE = /no longer available|already (been )?(assigned|accepted)|not available|assigned to another/i;
+
+/**
+ * @param {object} opts
+ * @param {import('../portal/session.js').PortalSession} opts.session
+ * @param {string} opts.orderId
+ * @param {string} [opts.newOrdersPath]
+ * @param {RegExp} [opts.declineLabel]  text/value identifying the Decline control
+ * @param {(html:string, orderId:string)=>object|null} [opts.locateDecline]
+ * @param {object} [opts.log]
+ * @param {boolean} [opts.reuseCachedPage]  see portalAccept.js's doc for the full
+ *        rationale/safety argument — same opt-in, same safe-fallback guarantee.
+ * @param {number} [opts.cacheMaxAgeMs]
+ */
+export async function declineViaPortal({
+  session,
+  orderId,
+  newOrdersPath,
+  declineLabel = /decline|reject/i,
+  locateDecline,
+  log = logger('decline:portal'),
+  reuseCachedPage = false,
+  cacheMaxAgeMs = 3000,
+}) {
+  const path = newOrdersPath || session.routes.newOrders;
+  log.info('decline attempt', { orderId });
+
+  const locate = (html) => (locateDecline ? locateDecline(html, orderId) : locateControlForOrder(html, orderId, declineLabel));
+
+  const cached = reuseCachedPage ? session.getCachedPage(path, cacheMaxAgeMs) : null;
+  if (cached && cached.body.includes(orderId)) {
+    log.info('decline: reusing recently polled page (skipping fresh GET)', { orderId, ageMs: Date.now() - cached.ts });
+    const result = await attempt(cached, { fromCache: true });
+    if (result) return result;
+    log.warn('decline: cached page rejected/unusable — falling back to a fresh GET', { orderId });
+  }
+
+  // A login bounce on either the GET or the POST below is handled transparently
+  // by session.authedGet/authedPost (re-auth + single retry); if it's STILL
+  // bounced after that retry, say so explicitly instead of falling through as a
+  // confusing 'not_found'/'unknown'.
+  const page = await session.authedGet(path);
+  const result = await attempt(page, { fromCache: false });
+  if (result) return result;
+  log.warn('decline: no decline control found for order', { orderId });
+  return {
+    ok: false,
+    outcome: 'not_found',
+    reason: `no decline control for order ${orderId}`,
+    reauthed: !!page._reauthed,
+    otpFetched: !!page._otpFetched,
+  };
+
+  /** @see portalAccept.js's attempt() — identical contract (null = "try a fresh page"). */
+  async function attempt(pageData, { fromCache }) {
+    const html = pageData.body;
+    const reauthed = !!pageData._reauthed;
+    const otpFetched = !!pageData._otpFetched;
+
+    if (looksLikeLogin(html)) {
+      if (fromCache) return null;
+      log.error('decline failed: still redirected to login after retry', {
+        orderId,
+        status: pageData.status,
+        bodySnippet: snippet(html),
+      });
+      return { ok: false, outcome: 'needs_login', status: pageData.status, bodySnippet: snippet(html), reauthed, otpFetched };
+    }
+
+    const pb = locate(html);
+    if (!pb) return null; // fresh path: caller reports not_found; cache path: try fresh
+
+    const body = buildControlClick(html, pb);
+
+    const res = await session.authedPost(path, body);
+    let resp = res.body || '';
+    let status = res.status;
+    let durationMs = res.durationMs || 0;
+    let nowReauthed = reauthed || !!res._reauthed;
+    let nowOtp = otpFetched || !!res._otpFetched;
+    let usedDetailsStep = false;
+
+    if (looksLikeLogin(resp)) {
+      if (fromCache) return null;
+      log.error('decline failed: postback still redirected to login after retry', {
+        orderId,
+        status,
+        bodySnippet: snippet(resp),
+      });
+      return {
+        ok: false,
+        outcome: 'needs_login',
+        status,
+        durationMs,
+        bodySnippet: snippet(resp),
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+      };
+    }
+    if (fromCache && looksLikeStaleState(resp)) return null;
+
+    if (GONE_RE.test(resp)) {
+      log.info('decline successful (already gone)', { orderId, via: 'portal' });
+      return { ok: true, outcome: 'gone', status, durationMs, reauthed: nowReauthed, otpFetched: nowOtp };
+    }
+    if (DECLINED_RE.test(resp)) {
+      log.info('decline successful', { orderId, via: 'portal', usedCachedPage: fromCache });
+      return { ok: true, outcome: 'declined', status, durationMs, reauthed: nowReauthed, otpFetched: nowOtp };
+    }
+
+    const detailsPb = findDetailsDecline(resp, orderId, declineLabel, locateDecline);
+    if (detailsPb) {
+      const pageUrl = res.url || session.url(path);
+      const postUrl = scrapeFormActionForControl(resp, pageUrl, detailsPb.target);
+      log.info('decline: confirmation page — posting second Decline', { orderId, postUrl });
+      const detailsBody = buildControlClick(resp, detailsPb);
+      const second = await session.authedPost(postUrl, detailsBody);
+      resp = second.body || '';
+      status = second.status;
+      durationMs = (durationMs || 0) + (second.durationMs || 0);
+      nowReauthed = nowReauthed || !!second._reauthed;
+      nowOtp = nowOtp || !!second._otpFetched;
+      usedDetailsStep = true;
+
+      if (looksLikeLogin(resp)) {
+        if (fromCache) return null;
+        log.error('decline failed: details Decline redirected to login after retry', {
+          orderId,
+          status,
+          bodySnippet: snippet(resp),
+        });
+        return {
+          ok: false,
+          outcome: 'needs_login',
+          status,
+          durationMs,
+          bodySnippet: snippet(resp),
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: ['list_postback', 'details_postback'],
+        };
+      }
+      if (GONE_RE.test(resp)) {
+        log.info('decline successful (already gone)', { orderId, via: 'portal' });
+        return {
+          ok: true,
+          outcome: 'gone',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: ['list_postback', 'details_postback'],
+        };
+      }
+      if (DECLINED_RE.test(resp)) {
+        log.info('decline successful', {
+          orderId,
+          via: 'portal',
+          usedCachedPage: fromCache,
+          steps: ['list_postback', 'details_postback'],
+        });
+        return {
+          ok: true,
+          outcome: 'declined',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: ['list_postback', 'details_postback'],
+        };
+      }
+    }
+
+    if (status >= 200 && status < 300) {
+      return {
+        ok: true,
+        outcome: 'submitted',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps: usedDetailsStep ? ['list_postback', 'details_postback'] : ['list_postback'],
+      };
+    }
+    // Non-2xx, unrecognized: from a cache attempt this is untrustworthy (could
+    // just be stale tokens) rather than a real failure — safe to retry fresh
+    // (decline, like accept, is atomic/idempotent server-side).
+    if (fromCache) return null;
+    log.error('decline failed: unrecognized postback response', { orderId, status, bodySnippet: snippet(resp) });
+    return {
+      ok: false,
+      outcome: 'unknown',
+      status,
+      durationMs,
+      bodySnippet: snippet(resp),
+      reauthed: nowReauthed,
+      otpFetched: nowOtp,
+    };
+  }
+}
+
+function findDetailsDecline(html, orderId, declineLabel, locateDecline) {
+  if (!html) return null;
+  if (orderId && html.includes(orderId) && /imgBtnDecline|grdNewOrders|New Orders/i.test(html)) {
+    const listPb = locateDecline ? locateDecline(html, orderId) : locateControlForOrder(html, orderId, declineLabel);
+    if (listPb && /imgBtnDecline|grdNewOrders|Broadcast/i.test(listPb.target || '')) return null;
+  }
+  if (locateDecline) {
+    const scoped = locateDecline(html, orderId);
+    if (scoped) return scoped;
+  }
+  const scoped = locateControlForOrder(html, orderId, declineLabel);
+  if (scoped) return scoped;
+  return findPostbackTarget(html, declineLabel);
+}
+
+/**
+ * Locate the control (decline) for a specific order: find the order id in the
+ * page, search a window after it for the matching postback target, widening
+ * backwards if needed, then fall back to a page-global control.
+ */
+export function locateControlForOrder(html, orderId, labelRe) {
+  if (orderId) {
+    const idx = html.indexOf(orderId);
+    // Order not on the page → do NOT fall back to a page-global control (that
+    // would act on a DIFFERENT order). Return null.
+    if (idx === -1) return null;
+    const local = findPostbackTarget(html.slice(idx, idx + 4000), labelRe);
+    if (local) return local;
+    return findPostbackTarget(html.slice(Math.max(0, idx - 2000), idx + 4000), labelRe);
+  }
+  return findPostbackTarget(html, labelRe);
+}
+
+export default declineViaPortal;
+===CAT_emailAccept===
+// Path A — accept via the ACCEPT ORDER link embedded in the order email.
+//
+// Real E-Street Gmail flow (owner-confirmed):
+//   1. GET the green ACCEPT ORDER link → confirmation page.
+//   2. Click green "Accept Order" (not "Accept Appraisal" — that is portal).
+//   3. Loading, then a green acceptance badge / success copy.
+//
+// Also supports: standalone GET accept, login bounce + one re-auth retry.
+import { HttpClient, formEncode } from '../util/httpClient.js';
+import {
+  buildControlClick,
+  findPostbackTarget,
+  looksLikeLogin,
+  scrapeFormActionForControl,
+} from '../portal/aspnet.js';
+import { logger } from '../util/logger.js';
+import { snippet } from '../portal/session.js';
+import { dumpAcceptDiagnostic } from './diagnostic.js';
+import { findConfirmAcceptControl, looksAccepted, looksLikePortalError, looksTaken } from './signals.js';
+
+/**
+ * @param {object} opts
+ * @param {string} opts.acceptUrl
+ * @param {HttpClient} [opts.http]
+ * @param {import('../portal/session.js').PortalSession} [opts.session]
+ * @param {RegExp} [opts.acceptLabel]  unused unless prefer fails — prefer "Accept Order"
+ * @param {object} [opts.log]
+ */
+export async function acceptViaEmailLink({
+  acceptUrl,
+  http,
+  session,
+  acceptLabel,
+  log = logger('accept:email'),
+}) {
+  if (!acceptUrl) {
+    return { ok: false, outcome: 'unknown', status: 0, durationMs: 0, bounced: false, reason: 'no acceptUrl' };
+  }
+
+  const startedAt = process.hrtime.bigint();
+  const client = http || session?.http || new HttpClient();
+  const steps = [];
+  let reauthed = false;
+  const done = (result) => finish(startedAt, { ...result, reauthed, otpFetched: !!session?._lastLoginUsedOtp });
+
+  log.info('accept attempt', { acceptUrl });
+
+  for (;;) {
+    const first = await client.get(acceptUrl, { followRedirects: true });
+    steps.push('email_get');
+    const pageUrl = first.url || acceptUrl;
+    const body = first.body || '';
+
+    if (looksLikeLogin(body) || /login/i.test(first.headers?.location || '')) {
+      if (session && !reauthed) {
+        reauthed = true;
+        if (await reauthenticate(session, log, acceptUrl)) continue;
+      }
+      log.error('accept failed: still redirected to login', {
+        acceptUrl,
+        retried: reauthed,
+        status: first.status,
+        bodySnippet: snippet(body),
+      });
+      return done({
+        ok: false,
+        outcome: 'needs_login',
+        status: first.status,
+        bounced: true,
+        steps,
+        bodySnippet: snippet(body),
+      });
+    }
+    if (looksTaken(body)) {
+      return done({ ok: false, outcome: 'taken', status: first.status, bounced: false, steps });
+    }
+    if (isAcceptedResponse(body, first.status)) {
+      log.info('accept successful', { acceptUrl, via: 'email', steps });
+      return done({ ok: true, outcome: 'accepted', status: first.status, bounced: false, steps });
+    }
+
+    // Confirmation page: prefer "Accept Order" (Gmail path), then Appraisal, then any Accept.
+    let pb = findConfirmAcceptControl(body, 'order');
+    if (!pb && acceptLabel) {
+      pb = findPostbackTarget(body, acceptLabel);
+    }
+    if (!pb) {
+      dumpAcceptDiagnostic({ orderId: orderIdFromUrl(acceptUrl), stage: 'email_no_accept_btn', html: body, url: pageUrl });
+      const ok = first.status >= 200 && first.status < 300;
+      if (!ok) {
+        log.error('accept failed: unrecognized response', { acceptUrl, status: first.status, bodySnippet: snippet(body) });
+      }
+      return done({
+        ok,
+        outcome: ok ? 'submitted' : 'unknown',
+        status: first.status,
+        bounced: false,
+        steps,
+        bodySnippet: ok ? undefined : snippet(body),
+      });
+    }
+
+    dumpAcceptDiagnostic({ orderId: orderIdFromUrl(acceptUrl), stage: 'email_confirm_page', html: body, url: pageUrl });
+    steps.push('details_postback');
+    const postUrl = scrapeFormActionForControl(body, pageUrl, pb.target);
+    const formBody = buildControlClick(body, pb);
+
+    const second = await client.post(postUrl, formEncode(formBody), { followRedirects: true });
+    const resp = second.body || '';
+
+    if (looksLikeLogin(resp)) {
+      if (session && !reauthed) {
+        reauthed = true;
+        if (await reauthenticate(session, log, acceptUrl)) continue;
+      }
+      log.error('accept failed: still redirected to login on details postback', {
+        acceptUrl,
+        retried: reauthed,
+        status: second.status,
+        bodySnippet: snippet(resp),
+      });
+      return done({
+        ok: false,
+        outcome: 'needs_login',
+        status: second.status,
+        bounced: true,
+        steps,
+        bodySnippet: snippet(resp),
+      });
+    }
+    if (looksTaken(resp)) {
+      return done({ ok: false, outcome: 'taken', status: second.status, bounced: false, steps });
+    }
+    if (looksLikePortalError(resp, second.url || postUrl)) {
+      dumpAcceptDiagnostic({
+        orderId: orderIdFromUrl(acceptUrl),
+        stage: 'email_post_accept_error',
+        html: resp,
+        url: second.url || postUrl,
+      });
+      log.error('accept failed: portal Error.aspx after email Accept Order', {
+        acceptUrl,
+        status: second.status,
+        bodySnippet: snippet(resp),
+      });
+      return done({
+        ok: false,
+        outcome: 'portal_error',
+        status: second.status,
+        bounced: false,
+        steps,
+        bodySnippet: snippet(resp),
+      });
+    }
+    if (isAcceptedResponse(resp, second.status)) {
+      log.info('accept successful', { acceptUrl, via: 'email', steps });
+      return done({ ok: true, outcome: 'accepted', status: second.status, bounced: false, steps });
+    }
+
+    dumpAcceptDiagnostic({
+      orderId: orderIdFromUrl(acceptUrl),
+      stage: 'email_post_accept',
+      html: resp,
+      url: second.url || postUrl,
+    });
+    {
+      const ok = second.status >= 200 && second.status < 300;
+      if (!ok) {
+        log.error('accept failed: unrecognized response on details postback', {
+          acceptUrl,
+          status: second.status,
+          bodySnippet: snippet(resp),
+        });
+      }
+      return done({
+        ok,
+        outcome: ok ? 'submitted' : 'unknown',
+        status: second.status,
+        bounced: false,
+        steps,
+        bodySnippet: ok ? undefined : snippet(resp),
+      });
+    }
+  }
+}
+
+async function reauthenticate(session, log, acceptUrl) {
+  log.warn('login required', { acceptUrl });
+  log.info('re-authenticating');
+  session.authenticated = false;
+  try {
+    await session.login();
+  } catch (e) {
+    log.error('re-authentication failed', { acceptUrl, err: String(e) });
+    return false;
+  }
+  log.info('login successful — retrying accept', { acceptUrl });
+  return true;
+}
+
+function isAcceptedResponse(body, status) {
+  return status >= 200 && status < 300 && looksAccepted(body);
+}
+
+function orderIdFromUrl(url) {
+  const m = String(url || '').match(/(\d{2,4}-\d{4,6})/);
+  return m ? m[1] : 'email';
+}
+
+function finish(startedAt, result) {
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  return { ...result, durationMs };
+}
+
+export default acceptViaEmailLink;
+===CAT_emailDecline===
+// Decline Path A — decline via the DECLINE ORDER link in the order email.
+//
+// Mirrors emailAccept.js. Out-of-region orders are actively declined so they
+// leave the user's queue. Supports the same three real-world behaviours:
+//   1. Standalone GET — link declines immediately.
+//   2. Two-step — GET opens an order page with a Decline/Reject button; we
+//      scrape VIEWSTATE and POST the confirm.
+//   3. Login bounce — the link (or the confirm postback) redirects to login.
+//      If a `session` was given, we re-authenticate (login + OTP if the portal
+//      challenges it) and retry the EXACT SAME request once. Only if that retry
+//      also bounces (or no session is available) do we give up and report
+//      `needs_login`.
+import { HttpClient, formEncode } from '../util/httpClient.js';
+import { buildPostback, findPostbackTarget, looksLikeLogin, scrapeFormAction } from '../portal/aspnet.js';
+import { logger } from '../util/logger.js';
+import { snippet } from '../portal/session.js';
+
+const DECLINED_RE = /declined|rejected|order declined|has been declined|removed from your|no longer in your (queue|list)|success/i;
+// "Already gone" is a fine terminal state for a decline — nothing left to do.
+const GONE_RE = /no longer available|already (been )?(assigned|accepted)|not available|assigned to another/i;
+
+/**
+ * @param {object} opts
+ * @param {string} opts.declineUrl
+ * @param {HttpClient} [opts.http]
+ * @param {import('../portal/session.js').PortalSession} [opts.session]
+ *        enables automatic re-authentication + a single retry on a login bounce.
+ * @param {RegExp} [opts.declineLabel]  label for the second-step Decline control
+ * @param {object} [opts.log]
+ * @returns {Promise<{ok:boolean, outcome:string, status:number, durationMs:number,
+ *                     bounced:boolean, steps?:string[]}>}
+ */
+export async function declineViaEmailLink({
+  declineUrl,
+  http,
+  session,
+  declineLabel = /decline|reject/i,
+  log = logger('decline:email'),
+}) {
+  if (!declineUrl) {
+    return { ok: false, outcome: 'no_link', status: 0, durationMs: 0, bounced: false, reason: 'no declineUrl' };
+  }
+
+  const startedAt = process.hrtime.bigint();
+  const client = http || session?.http || new HttpClient();
+  const steps = [];
+  let reauthed = false;
+  // Wraps finish() so every return site automatically carries whether THIS
+  // attempt needed a re-login/OTP, without threading it through every call site.
+  const done = (result) => finish(startedAt, { ...result, reauthed, otpFetched: !!session?._lastLoginUsedOtp });
+
+  log.info('decline attempt', { declineUrl });
+
+  // Bounded to a single re-auth retry: this loop runs at most twice (the
+  // original attempt, then one retry after a successful re-login).
+  for (;;) {
+    const first = await client.get(declineUrl, { followRedirects: true });
+    steps.push('email_get');
+    const pageUrl = first.url || declineUrl;
+    const body = first.body || '';
+
+    if (looksLikeLogin(body) || /login/i.test(first.headers?.location || '')) {
+      if (session && !reauthed) {
+        reauthed = true;
+        if (await reauthenticate(session, log, declineUrl)) continue;
+      }
+      log.error('decline failed: still redirected to login', {
+        declineUrl,
+        retried: reauthed,
+        status: first.status,
+        bodySnippet: snippet(body),
+      });
+      return done({
+        ok: false,
+        outcome: 'needs_login',
+        status: first.status,
+        bounced: true,
+        steps,
+        bodySnippet: snippet(body),
+      });
+    }
+    if (GONE_RE.test(body)) {
+      log.info('decline successful (already gone)', { declineUrl });
+      return done({ ok: true, outcome: 'gone', status: first.status, bounced: false, steps });
+    }
+    if (isDeclinedResponse(body, first.status)) {
+      log.info('decline successful', { declineUrl, via: 'email' });
+      return done({ ok: true, outcome: 'declined', status: first.status, bounced: false, steps });
+    }
+
+    // Two-step: details page with a Decline/Reject button / postback.
+    const pb = findPostbackTarget(body, declineLabel);
+    if (!pb) {
+      const ok = first.status >= 200 && first.status < 300;
+      if (!ok) {
+        log.error('decline failed: unrecognized response', { declineUrl, status: first.status, bodySnippet: snippet(body) });
+      }
+      return done({
+        ok,
+        outcome: ok ? 'submitted' : 'unknown',
+        status: first.status,
+        bounced: false,
+        steps,
+        bodySnippet: ok ? undefined : snippet(body),
+      });
+    }
+
+    steps.push('details_postback');
+    const postUrl = scrapeFormAction(body, pageUrl);
+    const extra = { ...(pb.extra || {}) };
+    if (pb.isSubmit && pb.submitValue) extra[pb.target] = pb.submitValue;
+    const formBody = buildPostback(body, pb.isSubmit ? '' : pb.target, pb.argument || '', extra);
+    if (!pb.isSubmit) formBody.__EVENTTARGET = pb.target;
+
+    const second = await client.post(postUrl, formEncode(formBody), { followRedirects: true });
+    const resp = second.body || '';
+
+    if (looksLikeLogin(resp)) {
+      if (session && !reauthed) {
+        reauthed = true;
+        if (await reauthenticate(session, log, declineUrl)) continue;
+      }
+      log.error('decline failed: still redirected to login on details postback', {
+        declineUrl,
+        retried: reauthed,
+        status: second.status,
+        bodySnippet: snippet(resp),
+      });
+      return done({
+        ok: false,
+        outcome: 'needs_login',
+        status: second.status,
+        bounced: true,
+        steps,
+        bodySnippet: snippet(resp),
+      });
+    }
+    if (GONE_RE.test(resp)) {
+      log.info('decline successful (already gone)', { declineUrl });
+      return done({ ok: true, outcome: 'gone', status: second.status, bounced: false, steps });
+    }
+    if (isDeclinedResponse(resp, second.status)) {
+      log.info('decline successful', { declineUrl, via: 'email' });
+      return done({ ok: true, outcome: 'declined', status: second.status, bounced: false, steps });
+    }
+    // Posted the decline but no explicit confirmation text — treat the 2xx as
+    // submitted; the executor's verify (re-read status) is the source of truth.
+    {
+      const ok = second.status >= 200 && second.status < 300;
+      if (!ok) {
+        log.error('decline failed: unrecognized response on details postback', {
+          declineUrl,
+          status: second.status,
+          bodySnippet: snippet(resp),
+        });
+      }
+      return done({
+        ok,
+        outcome: ok ? 'submitted' : 'unknown',
+        status: second.status,
+        bounced: false,
+        steps,
+        bodySnippet: ok ? undefined : snippet(resp),
+      });
+    }
+  }
+}
+
+/**
+ * Log in again (login() itself handles the OTP challenge if the portal presents
+ * one) and report whether it's safe to retry the original request.
+ * @returns {Promise<boolean>} true if login succeeded and the caller should retry
+ */
+async function reauthenticate(session, log, declineUrl) {
+  log.warn('login required', { declineUrl });
+  log.info('re-authenticating');
+  session.authenticated = false;
+  try {
+    await session.login();
+  } catch (e) {
+    log.error('re-authentication failed', { declineUrl, err: String(e) });
+    return false;
+  }
+  log.info('login successful — retrying decline', { declineUrl });
+  return true;
+}
+
+function isDeclinedResponse(body, status) {
+  return status >= 200 && status < 300 && DECLINED_RE.test(body);
+}
+
+function finish(startedAt, result) {
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  return { ...result, durationMs };
+}
+
+export default declineViaEmailLink;
+===CAT_race===
+// Shared "race two strategies, take the first confirmed win" helper.
+// Used by both the accept executor (Path A vs Path B) and the decline executor
+// (email-link vs portal). Resolves as soon as any task is a confirmed win;
+// otherwise waits for all to settle and returns the best non-error result.
+
+/** Attach a name to a promise result; never rejects (errors become a result). */
+export function tagResult(name, promise) {
+  return promise.then(
+    (r) => ({ ...r, __name: name }),
+    (err) => ({ ok: false, outcome: 'error', __name: name, error: String(err) })
+  );
+}
+
+/**
+ * Resolve with the first result for which `onSettle(name,result)` returns true;
+ * if none win, resolve with the all-settled "best" (first non-error, else first).
+ * @param {Array<Promise<object>>} tasks  promises produced by tagResult()
+ * @param {(name:string, result:object)=>boolean} onSettle
+ */
+export function firstSuccessOrAll(tasks, onSettle) {
+  return new Promise((resolve) => {
+    let remaining = tasks.length;
+    const all = [];
+    let resolved = false;
+    for (const t of tasks) {
+      t.then((result) => {
+        all.push(result);
+        const win = onSettle(result.__name, result);
+        if (win && !resolved) {
+          resolved = true;
+          resolve(result);
+        }
+        if (--remaining === 0 && !resolved) {
+          resolved = true;
+          resolve(all.find((r) => r && r.outcome !== 'error') || all[0] || null);
+        }
+      });
+    }
+  });
+}
+===CAT_verifier===
+// Order-status verifier — reads the portal to confirm an accept landed.
+// Returns 'accepted' | 'taken' | 'available' | 'unknown'.
+//
+// Dashboard "Accepted" must only follow a real portal confirmation. The default
+// status URL is often wrong on E-Street, so we also:
+//   1) inspect the New Orders row (still has Accept tick? → available)
+//   2) open In Progress Orders when possible and look for the order near
+//      "Accepted by Vendor" / "In Progress" / "File In Review"
+import {
+  buildControlClick,
+  findPostbackTarget,
+} from '../portal/aspnet.js';
+import { looksAccepted, looksAvailable, looksTaken } from './signals.js';
+
+/**
+ * @param {import('../portal/session.js').PortalSession} session
+ * @returns {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>}
+ */
+export function makePortalVerifier(session) {
+  return async function verify(orderId) {
+    if (!orderId) return 'unknown';
+
+    // 1) Dedicated status route (when the portal actually implements it).
+    if (typeof session.routes?.status === 'function') {
+      try {
+        const res = await session.authedGet(session.routes.status(orderId));
+        const hit = classifyStatusHtml(res.body || '', orderId);
+        if (hit) return hit;
+      } catch {
+        /* fall through */
+      }
+    }
+
+    // 2) New Orders — if our Accept tick is still there, we did NOT win.
+    try {
+      const page = await session.authedGet(session.routes.newOrders);
+      const html = page.body || '';
+      const onNew = classifyNearOrder(html, orderId);
+      if (onNew === 'available') return 'available';
+      if (onNew === 'taken') return 'taken';
+      if (onNew === 'accepted') return 'accepted';
+
+      // 3) Order left New Orders → check In Progress list (real E-Street home).
+      if (!html.includes(orderId)) {
+        const inProg = await fetchInProgressHtml(session, html);
+        if (inProg) {
+          const hit = classifyNearOrder(inProg, orderId);
+          if (hit) return hit;
+          // Whole-page accepted signals only when the order id is present.
+          if (inProg.includes(orderId) && looksAccepted(inProg) && !looksTaken(inProg)) {
+            return 'accepted';
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return 'unknown';
+  };
+}
+
+/**
+ * Classify a status/details page body.
+ * @returns {'accepted'|'taken'|'available'|null}
+ */
+export function classifyStatusHtml(body, orderId) {
+  if (looksTaken(body)) return 'taken';
+  if (looksAccepted(body)) return 'accepted';
+  if (looksAvailable(body)) return 'available';
+  return classifyNearOrder(body, orderId);
+}
+
+/**
+ * Look at a window around the order id (row / card), not the whole page nav.
+ * @returns {'accepted'|'taken'|'available'|null}
+ */
+export function classifyNearOrder(html, orderId) {
+  if (!html || !orderId) return null;
+  const idx = html.indexOf(orderId);
+  if (idx === -1) return null;
+  const win = html.slice(idx, idx + 3500);
+  if (/assigned to another|no longer available|reassigned/i.test(win)) return 'taken';
+  // Still on the broadcast list with an Accept control → not ours yet.
+  if (/imgBtnBroadcastAccept|BroadcastAccept/i.test(win)) return 'available';
+  if (
+    /accepted by vendor|accepted by you|assigned to you|\bfile in review\b|\bin progress\b/i.test(
+      win
+    )
+  ) {
+    return 'accepted';
+  }
+  return null;
+}
+
+/** Best-effort: post the "In Progress Orders" nav link from the current page. */
+async function fetchInProgressHtml(session, newOrdersHtml) {
+  const pb =
+    findPostbackTarget(newOrdersHtml, /in\s*progress\s*orders/i) ||
+    findPostbackTarget(newOrdersHtml, /show\s*in\s*progress/i);
+  if (!pb) return null;
+  const tgt = pb.target || '';
+  if (!/InProgress|ShowInProgress|inprogress/i.test(tgt)) return null;
+  try {
+    const body = buildControlClick(newOrdersHtml, pb);
+    const res = await session.authedPost(session.routes.newOrders, body);
+    return res.body || '';
+  } catch {
+    return null;
+  }
+}
+
+export default makePortalVerifier;

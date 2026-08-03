@@ -1,43 +1,41 @@
 // Path B — accept via the portal by replaying the WebForms __doPostBack.
 //
-// Robust fallback / verifier. Steps:
-//   1. GET the New Orders page on the warm authed session (or, opt-in, reuse a
-//      page the poller *just* fetched — see reuseCachedPage below).
-//   2. Scrape fresh __VIEWSTATE / __EVENTVALIDATION and locate the Accept
-//      control for this order (its __doPostBack target or submit button name).
-//   3. POST the postback back to the same page.
-//   4. Read the response for accepted / already-taken signals.
+// Real E-Street portal flow (owner-confirmed):
+//   1. GET New Orders → green tick (image Accept) for the order row.
+//   2. Confirmation page (AcceptAppraisal / AcceptBroadcastAppraisal) with
+//      green "Accept Appraisal" button → POST that.
+//   3. Loading, then order detail / in-progress (no alert popup).
 import { writeFile } from 'node:fs/promises';
-import { buildControlClick, findPostbackTarget, looksLikeLogin, looksLikeStaleState } from '../portal/aspnet.js';
+import {
+  buildControlClick,
+  findPostbackTarget,
+  looksLikeLogin,
+  looksLikeStaleState,
+  scrapeFormActionForControl,
+} from '../portal/aspnet.js';
 import { logger } from '../util/logger.js';
 import { snippet } from '../portal/session.js';
-
-const ACCEPTED_RE = /accepted|assigned to you|order accepted|in progress|success/i;
-const TAKEN_RE = /no longer available|already (been )?(assigned|accepted)|not available/i;
+import { dumpAcceptDiagnostic } from './diagnostic.js';
+import {
+  findConfirmAcceptControl,
+  isAcceptConfirmUrl,
+  looksAccepted,
+  looksLikePortalError,
+  looksTaken,
+} from './signals.js';
 
 /**
  * @param {object} opts
  * @param {import('../portal/session.js').PortalSession} opts.session
  * @param {string} opts.orderId
- * @param {string} [opts.newOrdersPath]   override the New Orders route
- * @param {RegExp} [opts.acceptLabel]     text/value that identifies the Accept control
+ * @param {string} [opts.newOrdersPath]
+ * @param {RegExp} [opts.acceptLabel]  list-row Accept locator (default /accept/i)
  * @param {(html:string, orderId:string)=>({target:string,argument?:string,extra?:object}|null)} [opts.locateAccept]
- *        custom locator for the accept control for a specific order row
  * @param {object} [opts.log]
  * @param {boolean} [opts.reuseCachedPage]
- *        OPT-IN, default false. The portal poller already fetches this exact
- *        page every couple of seconds; if a *very* recent copy is on hand,
- *        skip the fresh GET and build the postback straight from it — saves
- *        one full HTTP round-trip off the accept critical path. Unconfirmed
- *        against the real portal whether it tolerates a few-seconds-old
- *        VIEWSTATE on this page (see CLAUDE.md "Two production unknowns"), so
- *        this is disabled unless explicitly turned on per account, and is
- *        SAFE-BY-CONSTRUCTION regardless: any sign the cached tokens were
- *        rejected (stale-state page, login bounce, or even just an
- *        unrecognized response) falls back to a guaranteed-fresh GET+POST —
- *        so worst case this is exactly as slow as reuseCachedPage:false,
- *        never slower, never wrong.
- * @param {number} [opts.cacheMaxAgeMs]  how old a cached page may be (default 3000ms)
+ * @param {number} [opts.cacheMaxAgeMs]
+ * @param {{body:string, status?:number, url?:string, _reauthed?:boolean, _otpFetched?:boolean}} [opts.prefetchedPage]
+ *        New Orders page already fetched on the accept session (overlaps region/lock).
  */
 export async function acceptViaPortal({
   session,
@@ -48,27 +46,43 @@ export async function acceptViaPortal({
   log = logger('accept:portal'),
   reuseCachedPage = false,
   cacheMaxAgeMs = 3000,
+  prefetchedPage = null,
+  timeoutMs,
 }) {
   const path = newOrdersPath || session.routes.newOrders;
+  const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
   log.info('accept attempt', { orderId });
 
   const locate = (html) => (locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, acceptLabel));
+  const tag = (result, pageReuse, timings = {}) =>
+    result
+      ? {
+          ...result,
+          usedCachedPage: pageReuse !== 'fresh',
+          pageReuse,
+          timings: { ...(result.timings || {}), ...timings },
+        }
+      : result;
 
-  // Try the cached page first, IF asked to and it plausibly has this order.
+  if (prefetchedPage?.body && prefetchedPage.body.includes(orderId)) {
+    log.info('accept: using prefetched New Orders page (skipping GET)', { orderId });
+    const result = tag(await attempt(prefetchedPage, { fromCache: true }), 'prefetched', { listGetMs: 0 });
+    if (result) return result;
+    log.warn('accept: prefetched page rejected/unusable — falling back', { orderId });
+  }
+
   const cached = reuseCachedPage ? session.getCachedPage(path, cacheMaxAgeMs) : null;
   if (cached && cached.body.includes(orderId)) {
     log.info('accept: reusing recently polled page (skipping fresh GET)', { orderId, ageMs: Date.now() - cached.ts });
-    const result = await attempt(cached, { fromCache: true });
+    const result = tag(await attempt(cached, { fromCache: true }), 'cache', { listGetMs: 0 });
     if (result) return result;
     log.warn('accept: cached page rejected/unusable — falling back to a fresh GET', { orderId });
   }
 
-  // Guaranteed-fresh path (the only path when reuseCachedPage is off). A login
-  // bounce here is handled transparently by session.authedGet/authedPost
-  // (re-auth + single retry); if it's STILL bounced after that retry, say so
-  // explicitly instead of letting it fall through as a confusing 'not_found'.
-  const page = await session.authedGet(path);
-  const result = await attempt(page, { fromCache: false });
+  const getStarted = process.hrtime.bigint();
+  const page = await session.authedGet(path, httpOpts);
+  const listGetMs = Number(process.hrtime.bigint() - getStarted) / 1e6;
+  const result = tag(await attempt(page, { fromCache: false }), 'fresh', { listGetMs });
   if (result) return result;
   log.warn('accept: no accept control found for order', { orderId });
   return {
@@ -77,15 +91,11 @@ export async function acceptViaPortal({
     reason: `no accept control for order ${orderId}`,
     reauthed: !!page._reauthed,
     otpFetched: !!page._otpFetched,
+    usedCachedPage: false,
+    pageReuse: 'fresh',
+    timings: { listGetMs },
   };
 
-  /**
-   * One GET-page → locate → POST → interpret cycle.
-   * @returns the final result object, or `null` to mean "this page/response
-   *          couldn't be trusted — try again with a guaranteed-fresh page"
-   *          (only ever returned when fromCache is true; the fresh path always
-   *          returns a definitive result, even 'not_found'/'unknown').
-   */
   async function attempt(pageData, { fromCache }) {
     const html = pageData.body;
     const reauthed = !!pageData._reauthed;
@@ -103,85 +113,351 @@ export async function acceptViaPortal({
 
     const pb = locate(html);
     if (!pb) {
-      if (fromCache) return null; // maybe just stale — a fresh page might still have it
-      // TEMP DIAGNOSTIC: dump the real page whenever the accept control can't be
-      // located, so the actual markup is on hand instead of guessed at. Remove
-      // once the real portal's Accept control shape is confirmed and handled.
+      if (fromCache) return null;
       writeFile('/root/Estreet/data/dashboard-diagnostic.html', html, 'utf8').catch(() => {});
-      return null; // signals the caller to report not_found (keeps one code path)
+      return null;
     }
 
     const body = buildControlClick(html, pb);
 
-    const res = await session.authedPost(path, body);
-    const resp = res.body || '';
-    const nowReauthed = reauthed || !!res._reauthed;
-    const nowOtp = otpFetched || !!res._otpFetched;
+    const listUrl = typeof session.url === 'function' ? session.url(path) : path;
+    const listPostStarted = process.hrtime.bigint();
+    const res = await session.authedPost(path, body, {
+      headers: { referer: listUrl },
+      ...httpOpts,
+    });
+    const listPostMs = Number(process.hrtime.bigint() - listPostStarted) / 1e6;
+    let resp = res.body || '';
+    let status = res.status;
+    let durationMs = res.durationMs || 0;
+    let nowReauthed = reauthed || !!res._reauthed;
+    let nowOtp = otpFetched || !!res._otpFetched;
+    let usedDetailsStep = false;
+    let confirmMs = 0;
+    let pageUrl = res.url || (typeof session.url === 'function' ? session.url(path) : path);
+    const withTimings = (r) => (r ? { ...r, timings: { listPostMs, confirmMs } } : r);
 
     if (looksLikeLogin(resp)) {
       if (fromCache) return null;
       log.error('accept failed: postback still redirected to login after retry', {
         orderId,
-        status: res.status,
+        status,
         bodySnippet: snippet(resp),
       });
-      return {
+      return withTimings({
         ok: false,
         outcome: 'needs_login',
-        status: res.status,
-        durationMs: res.durationMs,
+        status,
+        durationMs,
         bodySnippet: snippet(resp),
         reauthed: nowReauthed,
         otpFetched: nowOtp,
-      };
+      });
     }
-    // Only meaningful for a cache attempt: the session IS fine, but these
-    // particular tokens were rejected as stale — a fresh GET gets new ones.
     if (fromCache && looksLikeStaleState(resp)) return null;
 
-    if (TAKEN_RE.test(resp)) {
-      return { ok: false, outcome: 'taken', status: res.status, durationMs: res.durationMs, reauthed: nowReauthed, otpFetched: nowOtp };
+    if (looksTaken(resp)) {
+      return withTimings({
+        ok: false,
+        outcome: 'taken',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+      });
     }
-    if (ACCEPTED_RE.test(resp) || (res.status >= 200 && res.status < 300)) {
-      log.info('accept successful', { orderId, via: 'portal', usedCachedPage: fromCache });
-      return { ok: true, outcome: 'accepted', status: res.status, durationMs: res.durationMs, reauthed: nowReauthed, otpFetched: nowOtp };
+    if (looksAccepted(resp)) {
+      log.info('accept successful', { orderId, via: 'portal', usedCachedPage: fromCache, steps: ['list_postback'] });
+      return withTimings({
+        ok: true,
+        outcome: 'accepted',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps: ['list_postback'],
+      });
     }
-    // An unrecognized response from a CACHE attempt is treated as untrustworthy
-    // rather than a real failure — retrying fresh is safe (the portal's accept
-    // is atomic/idempotent: a duplicate postback on an already-accepted order
-    // just comes back 'taken', it never double-accepts).
+
+    // Step 2: confirmation page — prefer "Accept Appraisal".
+    const detailsPb = findDetailsAccept(resp, orderId, pageUrl, locateAccept);
+    if (detailsPb) {
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_confirm_page', html: resp, url: pageUrl });
+      const postUrl = scrapeFormActionForControl(resp, pageUrl, detailsPb.target);
+      if (/&amp;/i.test(postUrl)) {
+        log.error('accept: form action still contains &amp; after decode — refusing POST', {
+          orderId,
+          postUrl,
+        });
+        return withTimings({
+          ok: false,
+          outcome: 'bad_url',
+          reason: 'form action retained &amp; entity',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: ['list_postback'],
+        });
+      }
+      const detailsBody = buildControlClick(resp, detailsPb);
+      const absPostUrl =
+        typeof session.url === 'function' && !/^https?:/i.test(postUrl)
+          ? session.url(postUrl)
+          : postUrl;
+      // Confirm URL already carries Accept=asis (same shape as the email link).
+      // Race a cookie'd GET against the WebForms POST — whichever settles with a
+      // decisive outcome first wins. The slow ~5–6s losses we saw were waiting
+      // only on the heavy postback+278KB Order page.
+      log.info('accept: confirmation page — racing Accept=asis GET + Appraisal POST', {
+        orderId,
+        postUrl: absPostUrl,
+      });
+
+      const detailsStarted = process.hrtime.bigint();
+      const second = await raceConfirmAccept({
+        session,
+        absPostUrl,
+        postUrl,
+        detailsBody,
+        referer: pageUrl,
+        orderId,
+        log,
+        timeoutMs: httpOpts.timeoutMs,
+      });
+      confirmMs = Number(process.hrtime.bigint() - detailsStarted) / 1e6;
+      resp = second.body || '';
+      status = second.status;
+      durationMs = (durationMs || 0) + (second.durationMs || confirmMs);
+      nowReauthed = nowReauthed || !!second._reauthed;
+      nowOtp = nowOtp || !!second._otpFetched;
+      usedDetailsStep = true;
+      pageUrl = second.url || absPostUrl;
+      const detailSteps = ['list_postback', second.via || 'details_postback'];
+
+      if (looksLikeLogin(resp)) {
+        if (fromCache) return null;
+        log.error('accept failed: details Accept redirected to login after retry', {
+          orderId,
+          status,
+          bodySnippet: snippet(resp),
+        });
+        return withTimings({
+          ok: false,
+          outcome: 'needs_login',
+          status,
+          durationMs,
+          bodySnippet: snippet(resp),
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        });
+      }
+      if (looksLikePortalError(resp, pageUrl)) {
+        dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept_error', html: resp, url: pageUrl });
+        log.error('accept failed: portal returned Error.aspx after Accept Appraisal', {
+          orderId,
+          status,
+          pageUrl,
+          bodySnippet: snippet(resp),
+        });
+        return withTimings({
+          ok: false,
+          outcome: 'portal_error',
+          status,
+          durationMs,
+          bodySnippet: snippet(resp),
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        });
+      }
+      if (looksTaken(resp)) {
+        dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept_taken', html: resp, url: pageUrl });
+        return withTimings({
+          ok: false,
+          outcome: 'taken',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        });
+      }
+      if (looksAccepted(resp)) {
+        log.info('accept successful', {
+          orderId,
+          via: 'portal',
+          usedCachedPage: fromCache,
+          confirmVia: second.via,
+          steps: detailSteps,
+        });
+        return withTimings({
+          ok: true,
+          outcome: 'accepted',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        });
+      }
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_post_accept', html: resp, url: pageUrl });
+    } else if (isAcceptConfirmUrl(pageUrl) || /ACCEPT\s+(APPRAISAL\s+)?ORDER/i.test(resp)) {
+      // Landed on confirm UI but could not locate the button — capture HTML.
+      dumpAcceptDiagnostic({ orderId, stage: 'portal_confirm_no_btn', html: resp, url: pageUrl });
+    }
+
+    const steps = usedDetailsStep ? ['list_postback', 'details_postback'] : ['list_postback'];
+
+    // Error.aspx has no order id either — never treat it as an optimistic submit.
+    if (looksLikePortalError(resp, pageUrl)) {
+      log.error('accept failed: portal error page (not a successful submit)', {
+        orderId,
+        status,
+        pageUrl,
+        steps,
+      });
+      return withTimings({
+        ok: false,
+        outcome: 'portal_error',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps,
+      });
+    }
+
+    if (status >= 200 && status < 300 && orderId && !resp.includes(orderId)) {
+      log.info('accept postback removed order from list — pending verify', {
+        orderId,
+        via: 'portal',
+        usedCachedPage: fromCache,
+        steps,
+      });
+      return withTimings({
+        ok: true,
+        outcome: 'submitted',
+        status,
+        durationMs,
+        reauthed: nowReauthed,
+        otpFetched: nowOtp,
+        steps,
+      });
+    }
     if (fromCache) return null;
-    log.error('accept failed: unrecognized postback response', { orderId, status: res.status, bodySnippet: snippet(resp) });
-    return {
+    log.error('accept failed: unrecognized postback response', { orderId, status, bodySnippet: snippet(resp), steps });
+    return withTimings({
       ok: false,
       outcome: 'unknown',
-      status: res.status,
-      durationMs: res.durationMs,
+      status,
+      durationMs,
       bodySnippet: snippet(resp),
       reauthed: nowReauthed,
       otpFetched: nowOtp,
-    };
+      steps,
+    });
   }
 }
 
 /**
- * Default locator: find the row/section that mentions the order id, then find an
- * Accept postback target within a window around it. Falls back to a page-global
- * accept control if rows aren't separable.
+ * Race cookie'd GET (URL already has Accept=asis) vs WebForms Accept Appraisal POST.
+ * First decisive response wins; otherwise prefer the POST result.
  */
+async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs }) {
+  const headers = { referer };
+  const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
+
+  const wrap = async (via, promise) => {
+    try {
+      const r = await promise;
+      return { ...r, via, _ok: true };
+    } catch (e) {
+      log.warn('confirm accept path error', { via, orderId, err: String(e) });
+      return { status: 0, body: '', durationMs: 0, via, _ok: false, error: String(e) };
+    }
+  };
+
+  const isDecisive = (r) => {
+    if (!r || r._ok === false) return false;
+    const body = r.body || '';
+    const url = r.url || absPostUrl;
+    if (looksLikeLogin(body)) return true;
+    if (looksLikePortalError(body, url)) return true;
+    if (looksTaken(body)) return true;
+    if (looksAccepted(body)) return true;
+    // Confirm UI still showing Accept Appraisal → GET alone did not finish.
+    if (findConfirmAcceptControl(body, 'appraisal')) return false;
+    if (r.status >= 200 && r.status < 300 && orderId && body && !body.includes(orderId)) return true;
+    return false;
+  };
+
+  const getP = wrap(
+    'details_get',
+    session.http.get(absPostUrl, { followRedirects: true, headers, ...httpOpts })
+  );
+  const postP = wrap(
+    'details_postback',
+    session.authedPost(postUrl, detailsBody, { headers, ...httpOpts })
+  );
+
+  return new Promise((resolve) => {
+    let remaining = 2;
+    /** @type {object[]} */
+    const settled = [];
+    let done = false;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      resolve(r);
+    };
+    const onSettle = (r) => {
+      settled.push(r);
+      if (isDecisive(r)) {
+        log.info('confirm accept path settled first', { orderId, via: r.via, status: r.status });
+        return finish(r);
+      }
+      if (--remaining === 0) {
+        finish(settled.find((x) => x.via === 'details_postback') || settled[0]);
+      }
+    };
+    getP.then(onSettle);
+    postP.then(onSettle);
+  });
+}
+
+/**
+ * Confirmation-page Accept: prefer Accept Appraisal; never re-click list tick.
+ */
+function findDetailsAccept(html, orderId, pageUrl, locateAccept) {
+  if (!html) return null;
+  const onConfirmUrl = isAcceptConfirmUrl(pageUrl);
+  if (orderId && html.includes(orderId) && /imgBtnBroadcastAccept|grdNewOrders/i.test(html) && !onConfirmUrl) {
+    const listPb = locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, /accept/i);
+    if (listPb && /BroadcastAccept|grdNewOrders/i.test(listPb.target || '')) return null;
+  }
+
+  const preferred = findConfirmAcceptControl(html, 'appraisal');
+  if (preferred) return preferred;
+
+  if (locateAccept) {
+    const scoped = locateAccept(html, orderId);
+    if (scoped) return scoped;
+  }
+  const scoped = locateAcceptForOrder(html, orderId, /accept/i);
+  if (scoped) return scoped;
+  return findPostbackTarget(html, /accept/i);
+}
+
 export function locateAcceptForOrder(html, orderId, acceptLabel = /accept/i) {
   if (orderId) {
     const idx = html.indexOf(orderId);
-    // Order not on the page (e.g. already taken/removed) → do NOT fall back to a
-    // page-global control: that would accept a DIFFERENT order. Return null.
     if (idx === -1) return null;
-    // Search a window after the order id for the nearest accept control.
     const local = findPostbackTarget(html.slice(idx, idx + 4000), acceptLabel);
     if (local) return local;
-    // Some layouts put the button before the id; widen backwards too.
     return findPostbackTarget(html.slice(Math.max(0, idx - 2000), idx + 4000), acceptLabel);
   }
-  // No order id given (single-order page): take the page's accept control.
   return findPostbackTarget(html, acceptLabel);
 }
 

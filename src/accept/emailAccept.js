@@ -1,40 +1,36 @@
 // Path A — accept via the ACCEPT ORDER link embedded in the order email.
 //
-// Supports three real-world behaviours:
-//   1. Standalone GET — link accepts immediately (~100–300ms).
-//   2. Two-step — GET opens an order-details page with a green Accept button;
-//      we scrape VIEWSTATE and POST the second accept (models E-Street flow).
-//   3. Login bounce — the link (or the details postback) redirects to login.
-//      If a `session` was given, we re-authenticate (login + OTP if the portal
-//      challenges it) and retry the EXACT SAME request once. Only if that retry
-//      also bounces (or no session is available) do we give up and report
-//      `needs_login`.
+// Real E-Street Gmail flow (owner-confirmed):
+//   1. GET the green ACCEPT ORDER link → confirmation page.
+//   2. Click green "Accept Order" (not "Accept Appraisal" — that is portal).
+//   3. Loading, then a green acceptance badge / success copy.
+//
+// Also supports: standalone GET accept, login bounce + one re-auth retry.
 import { HttpClient, formEncode } from '../util/httpClient.js';
-import { buildPostback, findPostbackTarget, looksLikeLogin, scrapeFormAction } from '../portal/aspnet.js';
+import {
+  buildControlClick,
+  findPostbackTarget,
+  looksLikeLogin,
+  scrapeFormActionForControl,
+} from '../portal/aspnet.js';
 import { logger } from '../util/logger.js';
 import { snippet } from '../portal/session.js';
-
-const ACCEPTED_RE = /accepted|assigned to you|order accepted|in progress|success|thank you/i;
-const TAKEN_RE = /no longer available|already (been )?(assigned|accepted)|not available|assigned to another/i;
+import { dumpAcceptDiagnostic } from './diagnostic.js';
+import { findConfirmAcceptControl, looksAccepted, looksLikePortalError, looksTaken } from './signals.js';
 
 /**
  * @param {object} opts
  * @param {string} opts.acceptUrl
  * @param {HttpClient} [opts.http]
  * @param {import('../portal/session.js').PortalSession} [opts.session]
- *        enables automatic re-authentication + a single retry on a login bounce.
- *        Without it, a bounce is reported as `needs_login` immediately (no way
- *        to log in).
- * @param {RegExp} [opts.acceptLabel]  label for the second-step Accept control
+ * @param {RegExp} [opts.acceptLabel]  unused unless prefer fails — prefer "Accept Order"
  * @param {object} [opts.log]
- * @returns {Promise<{ok:boolean, outcome:string, status:number, durationMs:number,
- *                     bounced:boolean, steps?:string[]}>}
  */
 export async function acceptViaEmailLink({
   acceptUrl,
   http,
   session,
-  acceptLabel = /accept/i,
+  acceptLabel,
   log = logger('accept:email'),
 }) {
   if (!acceptUrl) {
@@ -45,14 +41,10 @@ export async function acceptViaEmailLink({
   const client = http || session?.http || new HttpClient();
   const steps = [];
   let reauthed = false;
-  // Wraps finish() so every return site automatically carries whether THIS
-  // attempt needed a re-login/OTP, without threading it through every call site.
   const done = (result) => finish(startedAt, { ...result, reauthed, otpFetched: !!session?._lastLoginUsedOtp });
 
   log.info('accept attempt', { acceptUrl });
 
-  // Bounded to a single re-auth retry: this loop runs at most twice (the
-  // original attempt, then one retry after a successful re-login).
   for (;;) {
     const first = await client.get(acceptUrl, { followRedirects: true });
     steps.push('email_get');
@@ -79,24 +71,28 @@ export async function acceptViaEmailLink({
         bodySnippet: snippet(body),
       });
     }
-    if (TAKEN_RE.test(body)) {
+    if (looksTaken(body)) {
       return done({ ok: false, outcome: 'taken', status: first.status, bounced: false, steps });
     }
     if (isAcceptedResponse(body, first.status)) {
-      log.info('accept successful', { acceptUrl, via: 'email' });
+      log.info('accept successful', { acceptUrl, via: 'email', steps });
       return done({ ok: true, outcome: 'accepted', status: first.status, bounced: false, steps });
     }
 
-    // Two-step: details page with a green Accept button / postback.
-    const pb = findPostbackTarget(body, acceptLabel);
+    // Confirmation page: prefer "Accept Order" (Gmail path), then Appraisal, then any Accept.
+    let pb = findConfirmAcceptControl(body, 'order');
+    if (!pb && acceptLabel) {
+      pb = findPostbackTarget(body, acceptLabel);
+    }
     if (!pb) {
+      dumpAcceptDiagnostic({ orderId: orderIdFromUrl(acceptUrl), stage: 'email_no_accept_btn', html: body, url: pageUrl });
       const ok = first.status >= 200 && first.status < 300;
       if (!ok) {
         log.error('accept failed: unrecognized response', { acceptUrl, status: first.status, bodySnippet: snippet(body) });
       }
       return done({
         ok,
-        outcome: ok ? 'accepted' : 'unknown',
+        outcome: ok ? 'submitted' : 'unknown',
         status: first.status,
         bounced: false,
         steps,
@@ -104,12 +100,10 @@ export async function acceptViaEmailLink({
       });
     }
 
+    dumpAcceptDiagnostic({ orderId: orderIdFromUrl(acceptUrl), stage: 'email_confirm_page', html: body, url: pageUrl });
     steps.push('details_postback');
-    const postUrl = scrapeFormAction(body, pageUrl);
-    const extra = { ...(pb.extra || {}) };
-    if (pb.isSubmit && pb.submitValue) extra[pb.target] = pb.submitValue;
-    const formBody = buildPostback(body, pb.isSubmit ? '' : pb.target, pb.argument || '', extra);
-    if (!pb.isSubmit) formBody.__EVENTTARGET = pb.target;
+    const postUrl = scrapeFormActionForControl(body, pageUrl, pb.target);
+    const formBody = buildControlClick(body, pb);
 
     const second = await client.post(postUrl, formEncode(formBody), { followRedirects: true });
     const resp = second.body || '';
@@ -134,13 +128,41 @@ export async function acceptViaEmailLink({
         bodySnippet: snippet(resp),
       });
     }
-    if (TAKEN_RE.test(resp)) {
+    if (looksTaken(resp)) {
       return done({ ok: false, outcome: 'taken', status: second.status, bounced: false, steps });
     }
+    if (looksLikePortalError(resp, second.url || postUrl)) {
+      dumpAcceptDiagnostic({
+        orderId: orderIdFromUrl(acceptUrl),
+        stage: 'email_post_accept_error',
+        html: resp,
+        url: second.url || postUrl,
+      });
+      log.error('accept failed: portal Error.aspx after email Accept Order', {
+        acceptUrl,
+        status: second.status,
+        bodySnippet: snippet(resp),
+      });
+      return done({
+        ok: false,
+        outcome: 'portal_error',
+        status: second.status,
+        bounced: false,
+        steps,
+        bodySnippet: snippet(resp),
+      });
+    }
     if (isAcceptedResponse(resp, second.status)) {
-      log.info('accept successful', { acceptUrl, via: 'email' });
+      log.info('accept successful', { acceptUrl, via: 'email', steps });
       return done({ ok: true, outcome: 'accepted', status: second.status, bounced: false, steps });
     }
+
+    dumpAcceptDiagnostic({
+      orderId: orderIdFromUrl(acceptUrl),
+      stage: 'email_post_accept',
+      html: resp,
+      url: second.url || postUrl,
+    });
     {
       const ok = second.status >= 200 && second.status < 300;
       if (!ok) {
@@ -152,7 +174,7 @@ export async function acceptViaEmailLink({
       }
       return done({
         ok,
-        outcome: ok ? 'accepted' : 'unknown',
+        outcome: ok ? 'submitted' : 'unknown',
         status: second.status,
         bounced: false,
         steps,
@@ -162,11 +184,6 @@ export async function acceptViaEmailLink({
   }
 }
 
-/**
- * Log in again (login() itself handles the OTP challenge if the portal presents
- * one) and report whether it's safe to retry the original request.
- * @returns {Promise<boolean>} true if login succeeded and the caller should retry
- */
 async function reauthenticate(session, log, acceptUrl) {
   log.warn('login required', { acceptUrl });
   log.info('re-authenticating');
@@ -182,7 +199,12 @@ async function reauthenticate(session, log, acceptUrl) {
 }
 
 function isAcceptedResponse(body, status) {
-  return status >= 200 && status < 300 && (ACCEPTED_RE.test(body) || body.length === 0);
+  return status >= 200 && status < 300 && looksAccepted(body);
+}
+
+function orderIdFromUrl(url) {
+  const m = String(url || '').match(/(\d{2,4}-\d{4,6})/);
+  return m ? m[1] : 'email';
 }
 
 function finish(startedAt, result) {

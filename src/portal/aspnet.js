@@ -125,13 +125,40 @@ export function buildControlClick(html, pb) {
 export function scrapeFormAction(html, baseUrl) {
   const m = html.match(/<form\b[^>]*\baction\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i);
   if (!m) return baseUrl;
-  const action = (m[2] ?? m[3] ?? m[4] ?? '').trim();
+  // HTML serializers encode & as &amp; in attribute values; decode before URL().
+  const action = decodeAttr((m[2] ?? m[3] ?? m[4] ?? '').trim());
   if (!action || action === '#') return baseUrl;
   try {
     return new URL(action, baseUrl).toString();
   } catch {
     return baseUrl;
   }
+}
+
+/**
+ * Resolve the POST URL for a specific control: prefers that control's
+ * `formaction` (Accept vs Decline on one confirmation form), else the enclosing
+ * / first form action.
+ */
+export function scrapeFormActionForControl(html, baseUrl, controlName) {
+  if (controlName && html) {
+    const inputRe = /<input\b[^>]*>/gi;
+    let m;
+    while ((m = inputRe.exec(html))) {
+      const tag = m[0];
+      if (attr(tag, 'name') !== controlName) continue;
+      const formaction = decodeAttr(attr(tag, 'formaction') ?? '');
+      if (formaction && formaction !== '#') {
+        try {
+          return new URL(formaction, baseUrl).toString();
+        } catch {
+          /* fall through */
+        }
+      }
+      break;
+    }
+  }
+  return scrapeFormAction(html, baseUrl);
 }
 
 /** Heuristic: does this HTML look like a login page (i.e. we got bounced)? */
