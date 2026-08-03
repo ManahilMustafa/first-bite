@@ -1,13 +1,208 @@
 // Accept executor — the hot path.
 //
-// Race Path A (email) vs Path B (portal), then confirm against the portal.
+// Two modes:
+//   1. executeAcceptFast() — FIRE-AND-FORGET: builds the accept POST body from
+//      the prefetched page synchronously and fires it WITHOUT awaiting the
+//      response. Returns in <10ms. All follow-up work (parsing the response,
+//      verifying, recording) is the caller's job (via the deferred queue).
+//
+//   2. executeAccept() — FULL: the original race-both-paths-and-verify flow,
+//      kept for backwards compatibility and for the deferred settlement phase.
+//
 // Dashboard "Accepted" is driven by result.accepted — that flag must only be
 // true when we have real portal proof (or a hard path success that verify
 // corroborates). Soft/optimistic wins never become accepted:true alone.
 import { acceptViaEmailLink } from './emailAccept.js';
-import { acceptViaPortal } from './portalAccept.js';
+import { acceptViaPortal, locateAcceptForOrder } from './portalAccept.js';
 import { tagResult, firstSuccessOrAll } from './race.js';
+import { buildControlClick } from '../portal/aspnet.js';
 import { logger } from '../util/logger.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FAST MODE — fire-and-forget accept (<10ms)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build the accept POST body synchronously from prefetched HTML and fire the
+ * POST to the portal WITHOUT awaiting the response. Returns in <10ms.
+ *
+ * @param {object} opts
+ * @param {string} opts.orderId
+ * @param {import('../portal/session.js').PortalSession} opts.session
+ * @param {{body:string, url?:string}} [opts.prefetchedPage]
+ * @param {string} [opts.acceptUrl]  email ACCEPT link (fires a parallel GET)
+ * @param {object} [opts.log]
+ * @returns {{ fired: boolean, portalPromise?: Promise, emailPromise?: Promise,
+ *             reason?: string, firedAt: number }}
+ */
+export function executeAcceptFast({
+  orderId,
+  session,
+  prefetchedPage,
+  acceptUrl,
+  log = logger('accept:fast'),
+}) {
+  const firedAt = Date.now();
+
+  // ── Portal accept POST (Path B — primary) ──
+  let portalPromise = null;
+  if (session && prefetchedPage?.body) {
+    const html = prefetchedPage.body;
+    const pb = locateAcceptForOrder(html, orderId);
+    if (pb) {
+      const body = buildControlClick(html, pb);
+      const path = session.routes.newOrders;
+      const url = session.url(path);
+      const formBody = new URLSearchParams();
+      for (const [k, v] of Object.entries(body)) formBody.append(k, v ?? '');
+
+      // FIRE — bypass the exclusive gate for maximum speed.
+      // This POST is in-flight to the portal; we don't await the response.
+      portalPromise = session.http.post(url, formBody.toString(), {
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          referer: url,
+        },
+        followRedirects: true,
+      }).catch((e) => ({ ok: false, outcome: 'error', error: String(e), status: 0, body: '' }));
+
+      log.info('accept POST FIRED', { orderId, via: 'portal', url });
+    } else {
+      log.warn('no accept control found in prefetched page', { orderId });
+    }
+  }
+
+  // ── Email link GET (Path A — parallel) ──
+  let emailPromise = null;
+  if (acceptUrl && session?.http) {
+    emailPromise = session.http.get(acceptUrl, { followRedirects: true })
+      .catch((e) => ({ ok: false, outcome: 'error', error: String(e), status: 0, body: '' }));
+    log.info('accept GET FIRED', { orderId, via: 'email' });
+  }
+
+  if (!portalPromise && !emailPromise) {
+    return { fired: false, reason: 'no_accept_path', firedAt };
+  }
+
+  return { fired: true, portalPromise, emailPromise, firedAt };
+}
+
+/**
+ * Settle a fire-and-forget accept: await the in-flight responses, parse the
+ * outcome, optionally verify against the portal, and return a full result.
+ * Called from the deferred queue AFTER the hot path has already returned.
+ *
+ * @param {object} opts
+ * @param {object} opts.fired  return value from executeAcceptFast()
+ * @param {string} opts.orderId
+ * @param {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>} [opts.verify]
+ * @param {object} [opts.log]
+ * @returns {Promise<{accepted:boolean, via:string|null, outcome:string, durationMs:number,
+ *                     verifyDurationMs:number, verified:string|null, paths:object}>}
+ */
+export async function settleAcceptResult({
+  fired,
+  orderId,
+  verify,
+  log = logger('accept:settle'),
+}) {
+  const startedAt = process.hrtime.bigint();
+  const paths = {};
+
+  // Await portal response
+  if (fired.portalPromise) {
+    try {
+      const res = await fired.portalPromise;
+      const body = res?.body || '';
+      const { looksAccepted, looksTaken } = await import('./signals.js');
+      if (looksAccepted(body)) {
+        paths.portal = { ok: true, outcome: 'accepted', status: res.status };
+      } else if (looksTaken(body)) {
+        paths.portal = { ok: false, outcome: 'taken', status: res.status };
+      } else if (res.status >= 200 && res.status < 300 && orderId && !body.includes(orderId)) {
+        paths.portal = { ok: true, outcome: 'submitted', status: res.status };
+      } else {
+        paths.portal = { ok: false, outcome: res.error ? 'error' : 'unknown', status: res.status };
+      }
+    } catch (e) {
+      paths.portal = { ok: false, outcome: 'error', error: String(e) };
+    }
+  }
+
+  // Await email response
+  if (fired.emailPromise) {
+    try {
+      const res = await fired.emailPromise;
+      const body = res?.body || '';
+      const { looksAccepted, looksTaken } = await import('./signals.js');
+      if (looksAccepted(body)) {
+        paths.email = { ok: true, outcome: 'accepted', status: res.status };
+      } else if (looksTaken(body)) {
+        paths.email = { ok: false, outcome: 'taken', status: res.status };
+      } else if (res.status >= 200 && res.status < 300) {
+        paths.email = { ok: true, outcome: 'submitted', status: res.status };
+      } else {
+        paths.email = { ok: false, outcome: res.error ? 'error' : 'unknown', status: res.status };
+      }
+    } catch (e) {
+      paths.email = { ok: false, outcome: 'error', error: String(e) };
+    }
+  }
+
+  const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+
+  // Determine winner
+  let via = null;
+  let outcome = 'failed';
+  let accepted = false;
+
+  const winner = Object.entries(paths).find(([, p]) => p.ok && p.outcome === 'accepted');
+  const submitted = Object.entries(paths).find(([, p]) => p.ok && p.outcome === 'submitted');
+  const taken = Object.entries(paths).find(([, p]) => p.outcome === 'taken');
+
+  if (winner) {
+    via = winner[0];
+    outcome = 'accepted';
+    accepted = true;
+  } else if (submitted) {
+    via = submitted[0];
+    outcome = 'submitted';
+  } else if (taken) {
+    outcome = 'taken';
+  }
+
+  // Verify
+  let verified = null;
+  let verifyDurationMs = 0;
+  if (verify) {
+    const verifyStartedAt = process.hrtime.bigint();
+    try {
+      verified = await verify(orderId);
+      if (verified === 'taken') { accepted = false; outcome = 'taken'; }
+      else if (verified === 'available') { accepted = false; outcome = 'still_available'; }
+      else if (verified === 'accepted') { accepted = true; outcome = 'accepted'; via = via || 'verified'; }
+      else if (!accepted) { outcome = outcome === 'submitted' ? 'unverified' : outcome; }
+    } catch (e) {
+      log.warn('verify failed', { orderId, err: String(e) });
+      if (outcome === 'submitted') outcome = 'unverified';
+    } finally {
+      verifyDurationMs = Number(process.hrtime.bigint() - verifyStartedAt) / 1e6;
+    }
+  } else if (outcome === 'submitted') {
+    // No verifier — trust the optimistic submit
+    accepted = true;
+    outcome = 'accepted';
+  }
+
+  const totalSettleMs = Date.now() - fired.firedAt;
+  log.info('accept settled', { orderId, accepted, via, outcome, settleMs: Math.round(totalSettleMs), verified });
+
+  return { accepted, via, outcome, durationMs, verifyDurationMs, paths, verified };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FULL MODE — original race-and-verify (backwards compatible)
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * @param {object} opts

@@ -1,20 +1,22 @@
 // AccountWorker — everything for ONE account, fully isolated.
 //
+// FAST PATH: when a new order is detected, the accept POST fires within ~5ms
+// (synchronous body-build from prefetched HTML → fire POST, don't await). All
+// follow-up work (awaiting response, verifying, recording events, logging the
+// final result) runs in a DeferredQueue — it never blocks the next order.
+//
 // Owns: its portal session (cookie jar), its detectors (portal poller + the
 // Gmail detector feeds in externally via onOrder), its historyId cursor. Shares
 // only the Redis lock (exactly-once) with the rest of the fleet. Designed to run
 // as its own process/container so a crash/revocation only takes down this one.
-//
-// One session for poll + accept so the poller's fresh New Orders HTML can be
-// reused on the accept postback (skips a GET on the hot path). Session HTTP is
-// serialized via PortalSession._exclusive.
 import { PortalSession } from '../portal/session.js';
 import { PortalPoller } from '../detect/portalPoller.js';
-import { executeAccept } from '../accept/acceptExecutor.js';
+import { executeAcceptFast, settleAcceptResult, executeAccept } from '../accept/acceptExecutor.js';
 import { executeDecline } from '../accept/declineExecutor.js';
 import { makePortalVerifier } from '../accept/verifier.js';
 import { orderLockKey } from '../lock/lock.js';
 import { orderMatchesRegion } from '../util/regionFilter.js';
+import { DeferredQueue } from '../util/deferredQueue.js';
 import { logger } from '../util/logger.js';
 
 export class AccountWorker {
@@ -63,6 +65,7 @@ export class AccountWorker {
     });
     this.verify = makePortalVerifier(this.session);
     this.poller = null;
+    this._deferred = new DeferredQueue();
     this.stats = {
       detected: 0,
       accepted: 0,
@@ -72,6 +75,7 @@ export class AccountWorker {
       declined: 0,
       declineFailed: 0,
       regionUnknown: 0,
+      fastFired: 0,
     };
     this._started = false;
   }
@@ -103,10 +107,12 @@ export class AccountWorker {
   }
 
   /**
-   * Entry point for ANY detector (portal poller OR gmail watcher). Applies THIS
-   * account's region rule, then either accepts (in-region) or actively declines
-   * (out-of-region). Wins the lock → races strategy paths → verifies → reports.
-   * Idempotent per order via the lock.
+   * FAST-PATH entry point for ANY detector (portal poller OR gmail watcher).
+   *
+   * For IN-REGION orders with a prefetched page: fires the accept POST in
+   * <10ms and defers all follow-up (response parsing, verify, event record)
+   * to the background queue. For out-of-region or no-prefetched-page, falls
+   * back to the full (slower but more robust) executor.
    */
   async handleOrder(order) {
     const {
@@ -124,7 +130,6 @@ export class AccountWorker {
     } = order;
     const detectedAt = Date.now();
     this.stats.detected++;
-    this.log.info('order detected', { orderId, source, account: this.account.label, address, zip, state });
 
     let detectionLatencyMs = null;
     if (emailReceivedAt) detectionLatencyMs = detectedAt - emailReceivedAt;
@@ -142,10 +147,10 @@ export class AccountWorker {
       forwardingEmail: forwardingEmail ?? this.account.forwardingEmail ?? null,
     };
 
+    // ── Region undetermined → skip (never act on ambiguity) ──
     if (!region.allowed && !region.decided) {
       this.stats.regionUnknown++;
-      this.log.warn('region matched: undetermined — not acting', { orderId, source, meta: region.meta });
-      return this._report({
+      const skipEvent = {
         ...meta,
         action: 'skip',
         accepted: false,
@@ -153,62 +158,73 @@ export class AccountWorker {
         reason: 'region_unknown',
         detectedAt,
         detectionLatencyMs,
-      });
+      };
+      // Defer reporting — don't block the poller
+      this._deferred.push(() => this._report(skipEvent));
+      return skipEvent;
     }
-    this.log.info('region matched', {
-      orderId,
-      decision: region.allowed ? 'in-region — will accept' : 'out-of-region — will decline',
-      reason: region.reason,
-      meta: region.meta,
-    });
 
+    // ── Out-of-region → DEFER decline entirely (not time-critical) ──
+    if (!region.allowed) {
+      // Return a promise that resolves when decline completes — callers (tests,
+      // Gmail watcher) can await it; the poller fire-and-forgets.
+      return this._deferDecline({ orderId, declineUrl, source, region, prefetchedPage, meta, detectedAt, detectionLatencyMs });
+    }
+
+    // ── In-region → FAST ACCEPT ──
     const key = orderLockKey(`${this.account.id || this.account.portalUsername}:${orderId}`);
     const lockStartedAt = Date.now();
     const won = await this.lock.acquire(key);
     const lockWaitMs = Date.now() - lockStartedAt;
     if (!won) {
       this.stats.deduped++;
-      this.log.debug('order already in flight, skipping', { orderId, source });
-      return { ...meta, action: region.allowed ? 'accept' : 'decline', deduped: true };
+      return { ...meta, action: 'accept', deduped: true };
     }
 
-    let event = region.allowed
-      ? await this._accept({ orderId, acceptUrl, source, prefetchedPage })
-      : await this._decline({ orderId, declineUrl, source, region, prefetchedPage });
-    const totalMs = Date.now() - detectedAt;
-    event = {
-      ...event,
-      address: meta.address,
-      state: meta.state,
-      zip: meta.zip,
-      account: meta.account,
-      accountId: meta.accountId,
-      forwardingEmail: meta.forwardingEmail,
-      detectedAt,
-      detectionLatencyMs,
-      lockWaitMs,
-      totalMs,
-    };
+    // Try the fast fire-and-forget path (requires prefetched page with the order)
+    if (prefetchedPage?.body && prefetchedPage.body.includes(orderId)) {
+      const fired = executeAcceptFast({
+        orderId,
+        session: this.session,
+        prefetchedPage,
+        acceptUrl,
+        log: this.log.child('accept:fast'),
+      });
 
-    const acted = event.accepted || event.declined;
-    if (!acted) await this.lock.release(key);
+      if (fired.fired) {
+        this.stats.fastFired++;
+        const hotPathMs = Date.now() - detectedAt;
+        this.log.info('⚡ FAST ACCEPT fired', { orderId, source, hotPathMs });
 
-    return this._report(event);
-  }
+        // Settle in the background but expose a .settled promise for callers
+        // that need the final result (tests, Gmail watcher).
+        const settlePromise = this._settleInBackground({
+          fired, orderId, key, source, meta, detectedAt, detectionLatencyMs, lockWaitMs,
+        });
 
-  _report(event) {
-    if (this.onResult) {
-      try {
-        this.onResult(event);
-      } catch (e) {
-        this.log.warn('onResult threw', { err: String(e) });
+        // Return immediately with a preliminary event
+        const event = {
+          action: 'accept',
+          accepted: true, // optimistic — will be corrected by settlement
+          declined: false,
+          orderId,
+          source,
+          ...meta,
+          detectedAt,
+          detectionLatencyMs,
+          lockWaitMs,
+          totalMs: Date.now() - detectedAt,
+          fastFired: true,
+          hotPathMs,
+          settled: settlePromise,
+        };
+        return event;
       }
+      // Fast path couldn't fire (no accept control) — fall through to full mode
     }
-    return event;
-  }
 
-  async _accept({ orderId, acceptUrl, source, prefetchedPage }) {
-    this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
+    // ── FULL MODE fallback (no prefetched page, or fast path failed) ──
+    this.log.info('accepting in-region order (full mode)', { orderId, source, hasEmailLink: !!acceptUrl });
     let result;
     try {
       result = await executeAccept({
@@ -223,20 +239,129 @@ export class AccountWorker {
       result = { accepted: false, via: null, outcome: 'error', error: String(e) };
       this.log.error('accept threw', { orderId, err: String(e) });
     }
+
     if (result.accepted) this.stats.accepted++;
     else if (result.outcome === 'taken') this.stats.taken++;
     else this.stats.failed++;
-    return { ...result, action: 'accept', declined: false, orderId, source, account: this.account.portalUsername };
+
+    const event = {
+      ...result,
+      action: 'accept',
+      declined: false,
+      orderId,
+      source,
+      account: this.account.portalUsername,
+      ...meta,
+      detectedAt,
+      detectionLatencyMs,
+      lockWaitMs,
+      totalMs: Date.now() - detectedAt,
+      fastFired: false,
+    };
+
+    const acted = result.accepted;
+    if (!acted) await this.lock.release(key);
+    return this._report(event);
   }
 
-  async _decline({ orderId, declineUrl, source, region, prefetchedPage }) {
-    this.log.info('declining out-of-region order', {
+  _report(event) {
+    if (this.onResult) {
+      try {
+        this.onResult(event);
+      } catch (e) {
+        this.log.warn('onResult threw', { err: String(e) });
+      }
+    }
+    return event;
+  }
+
+  /**
+   * Run decline in the deferred queue. Returns a promise that resolves to the
+   * final event — callers that need the result (tests, Gmail watcher) can
+   * await it; the poller just fire-and-forgets.
+   */
+  async _deferDecline({ orderId, declineUrl, source, region, prefetchedPage, meta, detectedAt, detectionLatencyMs }) {
+    const key = orderLockKey(`${this.account.id || this.account.portalUsername}:${orderId}`);
+    const won = await this.lock.acquire(key);
+    if (!won) { this.stats.deduped++; return { ...meta, action: 'decline', deduped: true }; }
+
+    this.log.info('declining out-of-region order', { orderId, source, reason: region.reason });
+    let event;
+    try {
+      event = await this._decline({ orderId, declineUrl, source, region, prefetchedPage });
+    } catch (e) {
+      event = { declined: false, via: null, outcome: 'error', error: String(e) };
+      this.log.error('decline threw', { orderId, err: String(e) });
+    }
+    if (event.declined) this.stats.declined++;
+    else this.stats.declineFailed++;
+    event = {
+      ...event,
+      action: 'decline',
+      accepted: false,
       orderId,
       source,
       reason: region.reason,
-      meta: region.meta,
-      hasEmailLink: !!declineUrl,
+      ...meta,
+      detectedAt,
+      detectionLatencyMs,
+      totalMs: Date.now() - detectedAt,
+    };
+    const acted = event.declined;
+    if (!acted) await this.lock.release(key);
+    this._report(event);
+    return event;
+  }
+
+  /**
+   * Push settlement into the deferred queue and return a promise for the final
+   * result. The hot path fires the POST and returns; this runs after.
+   */
+  _settleInBackground({ fired, orderId, key, source, meta, detectedAt, detectionLatencyMs, lockWaitMs }) {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+
+    this._deferred.push(async () => {
+      let result;
+      try {
+        result = await settleAcceptResult({
+          fired,
+          orderId,
+          verify: this.verify,
+          log: this.log.child('accept:settle'),
+        });
+      } catch (e) {
+        result = { accepted: false, via: null, outcome: 'error', error: String(e), paths: {} };
+        this.log.error('settle threw', { orderId, err: String(e) });
+      }
+
+      if (result.accepted) this.stats.accepted++;
+      else if (result.outcome === 'taken') this.stats.taken++;
+      else this.stats.failed++;
+
+      const event = {
+        ...result,
+        action: 'accept',
+        declined: false,
+        orderId,
+        source,
+        ...meta,
+        detectedAt,
+        detectionLatencyMs,
+        lockWaitMs,
+        totalMs: Date.now() - detectedAt,
+        fastFired: true,
+      };
+
+      if (!result.accepted) await this.lock.release(key);
+      this._report(event);
+      resolve(event);
     });
+
+    return promise;
+  }
+
+  async _decline({ orderId, declineUrl, source, region, prefetchedPage }) {
     let result;
     try {
       result = await executeDecline({
@@ -251,17 +376,7 @@ export class AccountWorker {
       result = { declined: false, via: null, outcome: 'error', error: String(e) };
       this.log.error('decline threw', { orderId, err: String(e) });
     }
-    if (result.declined) this.stats.declined++;
-    else this.stats.declineFailed++;
-    return {
-      ...result,
-      action: 'decline',
-      accepted: false,
-      orderId,
-      source,
-      reason: region.reason,
-      account: this.account.portalUsername,
-    };
+    return result;
   }
 
   async stop() {
@@ -273,3 +388,4 @@ export class AccountWorker {
 }
 
 export default AccountWorker;
+
