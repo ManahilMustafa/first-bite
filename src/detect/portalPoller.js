@@ -243,27 +243,29 @@ export class PortalPoller {
           this.seen.add(id);
           this.stats.detected++;
           this.log.info('NEW order detected', { orderId: id });
-          // Fire-and-forget — don't await onOrder. If 5 orders land in one
-          // poll, all 5 accept POSTs fire within microseconds of each other.
-          const address = extractAddressNearOrder(page.body, id);
-          const meta = parseAddressMeta(address || '');
-          Promise.resolve(this.onOrder({
-            orderId: id,
-            source: 'portal',
-            address,
-            zip: meta.zip,
-            state: meta.state,
-            previousPollAt,
-            // Same HTML the poller just fetched — accept/decline can POST
-            // without a duplicate New Orders GET on the hot path.
-            prefetchedPage: {
-              body: page.body,
-              status: page.status,
-              url: page.url,
-              _reauthed: page._reauthed,
-              _otpFetched: page._otpFetched,
-            },
-          })).catch((e) => this.log.error('onOrder handler threw', { orderId: id, err: String(e) }));
+          try {
+            const address = extractAddressNearOrder(page.body, id);
+            const meta = parseAddressMeta(address || '');
+            this.onOrder({
+              orderId: id,
+              source: 'portal',
+              address,
+              zip: meta.zip,
+              state: meta.state,
+              previousPollAt,
+              // Same HTML the poller just fetched — accept/decline can POST
+              // without a duplicate New Orders GET on the hot path.
+              prefetchedPage: {
+                body: page.body,
+                status: page.status,
+                url: page.url,
+                _reauthed: page._reauthed,
+                _otpFetched: page._otpFetched,
+              },
+            });
+          } catch (e) {
+            this.log.error('onOrder handler threw', { err: String(e) });
+          }
         }
       }
       this.stats.polls++;
