@@ -107,6 +107,48 @@ test('reported events carry the full latency-report instrumentation (detection/l
   }
 });
 
+test('poller is released as soon as the accept race settles, before verify finishes', async () => {
+  const lock = new MemoryLock();
+  const worker = makeWorker({ username: 'vendor1', password: 'pass1' }, lock);
+  try {
+    await worker.start();
+
+    // Slow verify down artificially so there's a window to observe in: the
+    // poller must come off hold WHILE this is still pending, not after —
+    // that's the whole point of onAfterRace (verify is outcome reporting,
+    // not part of winning the race, and shouldn't keep the poller blind).
+    const realVerify = worker.verify;
+    let verifyResolvedAt = 0;
+    worker.verify = async (orderId) => {
+      const r = await realVerify(orderId);
+      await new Promise((res) => setTimeout(res, 150));
+      verifyResolvedAt = Date.now();
+      return r;
+    };
+
+    let releasedAt = 0;
+    const originalRelease = worker.poller.release.bind(worker.poller);
+    worker.poller.release = (reason) => {
+      // _holds is still 1 here (about to drop to 0) — capture the moment the
+      // hold this accept took is actually being released.
+      if (worker.poller._holds === 1) releasedAt = Date.now();
+      return originalRelease(reason);
+    };
+
+    portal.addOrder('266-07777', { address: '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613' });
+    await waitFor(() => portal.orderStatus('266-07777') === 'accepted', 5000);
+    await waitFor(() => verifyResolvedAt > 0, 5000);
+
+    assert.ok(releasedAt > 0, 'poller.release should have been called for this accept');
+    assert.ok(
+      releasedAt < verifyResolvedAt,
+      `poller released at +${releasedAt} should be before verify finished at +${verifyResolvedAt}`
+    );
+  } finally {
+    await worker.stop();
+  }
+});
+
 test('region filter DECLINES out-of-region orders and ACCEPTS in-region ones', async () => {
   const lock = new MemoryLock();
   const worker = new AccountWorker({
