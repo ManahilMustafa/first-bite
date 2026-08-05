@@ -209,6 +209,17 @@ export class AccountWorker {
 
   async _accept({ orderId, acceptUrl, source, prefetchedPage }) {
     this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
+    // Hold the poller for the race itself (Path A/B), but release it the
+    // moment the race settles — verify() below is outcome reporting only, and
+    // the poller sitting blind for that extra round-trip is pure lost
+    // detection time for the NEXT order on this account.
+    this.poller?.hold('accept');
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.poller?.release('accept');
+    };
     let result;
     try {
       result = await executeAccept({
@@ -217,11 +228,14 @@ export class AccountWorker {
         session: this.session,
         portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
         verify: this.verify,
+        onAfterRace: release,
         log: this.log.child('accept'),
       });
     } catch (e) {
       result = { accepted: false, via: null, outcome: 'error', error: String(e) };
       this.log.error('accept threw', { orderId, err: String(e) });
+    } finally {
+      release();
     }
     if (result.accepted) this.stats.accepted++;
     else if (result.outcome === 'taken') this.stats.taken++;
@@ -237,6 +251,13 @@ export class AccountWorker {
       meta: region.meta,
       hasEmailLink: !!declineUrl,
     });
+    this.poller?.hold('decline');
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.poller?.release('decline');
+    };
     let result;
     try {
       result = await executeDecline({
@@ -245,11 +266,14 @@ export class AccountWorker {
         session: this.session,
         portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
         verify: this.verify,
+        onAfterRace: release,
         log: this.log.child('decline'),
       });
     } catch (e) {
       result = { declined: false, via: null, outcome: 'error', error: String(e) };
       this.log.error('decline threw', { orderId, err: String(e) });
+    } finally {
+      release();
     }
     if (result.declined) this.stats.declined++;
     else this.stats.declineFailed++;

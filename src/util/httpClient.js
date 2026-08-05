@@ -8,6 +8,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { URL } from 'node:url';
+import zlib from 'node:zlib';
 
 /** Minimal cookie jar: stores name=value per host, serializes on each request. */
 export class CookieJar {
@@ -66,6 +67,10 @@ export class HttpClient {
       'user-agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      // ASP.NET WebForms pages here run 100–300KB of VIEWSTATE-heavy markup;
+      // requesting compression shrinks that transfer 70-85% on the hot path
+      // (poller GET every poll interval, accept/decline confirm pages).
+      'accept-encoding': 'gzip, deflate, br',
       ...defaultHeaders,
     };
     // Warm, reused connection pools — the key latency optimization.
@@ -115,10 +120,16 @@ export class HttpClient {
           res.on('data', (c) => chunks.push(c));
           res.on('end', async () => {
             const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+            let bodyBuf = Buffer.concat(chunks);
+            try {
+              bodyBuf = decompressBody(bodyBuf, res.headers['content-encoding']);
+            } catch (e) {
+              return reject(new Error(`Failed to decompress response (${res.headers['content-encoding']}): ${e.message}`));
+            }
             const result = {
               status: res.statusCode,
               headers: res.headers,
-              body: Buffer.concat(chunks).toString('utf8'),
+              body: bodyBuf.toString('utf8'),
               location: res.headers['location'],
               redirected: false,
               url: urlStr,
@@ -189,6 +200,16 @@ export class HttpClient {
     this.httpAgent.destroy();
     this.httpsAgent.destroy();
   }
+}
+
+/** Decompress a response body per its Content-Encoding, if any (empty body passes through). */
+function decompressBody(buf, contentEncoding) {
+  if (!buf.length) return buf;
+  const enc = String(contentEncoding || '').toLowerCase();
+  if (enc.includes('br')) return zlib.brotliDecompressSync(buf);
+  if (enc.includes('gzip')) return zlib.gunzipSync(buf);
+  if (enc.includes('deflate')) return zlib.inflateSync(buf);
+  return buf;
 }
 
 export function formEncode(obj) {
