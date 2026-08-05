@@ -74,6 +74,10 @@ export class AccountWorker {
       regionUnknown: 0,
     };
     this._started = false;
+    // Serialize portal accept/decline so bulk orders don't share one VIEWSTATE
+    // stampede. Prefetch HTML body ref is single-use across the queue.
+    this._portalWork = Promise.resolve();
+    this._spentPrefetchBody = null;
   }
 
   async start() {
@@ -207,26 +211,70 @@ export class AccountWorker {
     return event;
   }
 
+  /**
+   * Run portal accept/decline one-at-a-time for this account.
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  _enqueuePortalWork(fn) {
+    const run = this._portalWork.then(fn, fn);
+    this._portalWork = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  }
+
+  /** First consumer of a poll tick's HTML keeps it; later bulk siblings get fresh GET. */
+  _takePrefetch(prefetchedPage) {
+    if (!prefetchedPage?.body) return null;
+    if (this._spentPrefetchBody === prefetchedPage.body) return null;
+    this._spentPrefetchBody = prefetchedPage.body;
+    return prefetchedPage;
+  }
+
   async _accept({ orderId, acceptUrl, source, prefetchedPage }) {
     this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
-    let result;
-    try {
-      result = await executeAccept({
-        orderId,
-        acceptUrl,
-        session: this.session,
-        portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
-        verify: this.verify,
-        log: this.log.child('accept'),
-      });
-    } catch (e) {
-      result = { accepted: false, via: null, outcome: 'error', error: String(e) };
-      this.log.error('accept threw', { orderId, err: String(e) });
-    }
-    if (result.accepted) this.stats.accepted++;
-    else if (result.outcome === 'taken') this.stats.taken++;
-    else this.stats.failed++;
-    return { ...result, action: 'accept', declined: false, orderId, source, account: this.account.portalUsername };
+    return this._enqueuePortalWork(async () => {
+      let released = false;
+      const releaseHold = () => {
+        if (released) return;
+        released = true;
+        this.poller?.release('accept');
+      };
+      this.poller?.hold('accept');
+      let result;
+      try {
+        result = await executeAccept({
+          orderId,
+          acceptUrl,
+          session: this.session,
+          portalOpts: {
+            ...this.portalOpts,
+            prefetchedPage: this._takePrefetch(prefetchedPage),
+          },
+          verify: this.verify,
+          onAfterRace: releaseHold,
+          log: this.log.child('accept'),
+        });
+      } catch (e) {
+        result = { accepted: false, via: null, outcome: 'error', error: String(e) };
+        this.log.error('accept threw', { orderId, err: String(e) });
+      } finally {
+        releaseHold();
+        // Spent VIEWSTATE must not be reused by the next bulk item.
+        try {
+          this.session._pageCache?.clear?.();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (result.accepted) this.stats.accepted++;
+      else if (result.outcome === 'taken') this.stats.taken++;
+      else this.stats.failed++;
+      return { ...result, action: 'accept', declined: false, orderId, source, account: this.account.portalUsername };
+    });
   }
 
   async _decline({ orderId, declineUrl, source, region, prefetchedPage }) {
@@ -237,31 +285,51 @@ export class AccountWorker {
       meta: region.meta,
       hasEmailLink: !!declineUrl,
     });
-    let result;
-    try {
-      result = await executeDecline({
+    return this._enqueuePortalWork(async () => {
+      let released = false;
+      const releaseHold = () => {
+        if (released) return;
+        released = true;
+        this.poller?.release('decline');
+      };
+      this.poller?.hold('decline');
+      let result;
+      try {
+        result = await executeDecline({
+          orderId,
+          declineUrl,
+          session: this.session,
+          portalOpts: {
+            ...this.portalOpts,
+            prefetchedPage: this._takePrefetch(prefetchedPage),
+          },
+          verify: this.verify,
+          onAfterRace: releaseHold,
+          log: this.log.child('decline'),
+        });
+      } catch (e) {
+        result = { declined: false, via: null, outcome: 'error', error: String(e) };
+        this.log.error('decline threw', { orderId, err: String(e) });
+      } finally {
+        releaseHold();
+        try {
+          this.session._pageCache?.clear?.();
+        } catch {
+          /* ignore */
+        }
+      }
+      if (result.declined) this.stats.declined++;
+      else this.stats.declineFailed++;
+      return {
+        ...result,
+        action: 'decline',
+        accepted: false,
         orderId,
-        declineUrl,
-        session: this.session,
-        portalOpts: { ...this.portalOpts, prefetchedPage: prefetchedPage || null },
-        verify: this.verify,
-        log: this.log.child('decline'),
-      });
-    } catch (e) {
-      result = { declined: false, via: null, outcome: 'error', error: String(e) };
-      this.log.error('decline threw', { orderId, err: String(e) });
-    }
-    if (result.declined) this.stats.declined++;
-    else this.stats.declineFailed++;
-    return {
-      ...result,
-      action: 'decline',
-      accepted: false,
-      orderId,
-      source,
-      reason: region.reason,
-      account: this.account.portalUsername,
-    };
+        source,
+        reason: region.reason,
+        account: this.account.portalUsername,
+      };
+    });
   }
 
   async stop() {

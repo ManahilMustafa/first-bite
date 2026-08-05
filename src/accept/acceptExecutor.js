@@ -58,16 +58,21 @@ export async function executeAccept({
     paths[name] = result;
     return result?.ok === true;
   });
-  // Winner may resolve early; wait for the loser so the session is quiet before
-  // we hand the poller back / start verify.
-  await Promise.all(tasks);
-
+  // Release poller / start next bulk item ASAP — do NOT wait for the losing
+  // path. Losers finish in the background; verify still serializes on the
+  // session gate if it needs the portal.
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
   try {
     onAfterRace?.();
   } catch (e) {
     log.warn('onAfterRace threw', { orderId, err: String(e) });
   }
+  // Best-effort: collect late path results for logging without blocking the hot path.
+  Promise.all(tasks).then((all) => {
+    for (const r of all) {
+      if (r?.__name && !paths[r.__name]) paths[r.__name] = r;
+    }
+  }).catch(() => {});
 
   let via = null;
   let outcome = 'failed';
@@ -96,7 +101,16 @@ export async function executeAccept({
       const neverActed = Object.values(paths).every(
         (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)
       );
+      // Timeout/error after we clicked still counts as acted (verify may recover).
       const pathHardWin = !!(winner?.ok && winner.outcome === 'accepted');
+      const actedSoft = Object.values(paths).some(
+        (p) =>
+          p &&
+          (p.outcome === 'error' ||
+            p.outcome === 'unknown' ||
+            p.outcome === 'submitted' ||
+            (Array.isArray(p.steps) && p.steps.length > 0))
+      );
 
       if (verified === 'taken') {
         accepted = false;
@@ -113,7 +127,7 @@ export async function executeAccept({
       } else if (verified === 'accepted') {
         // Portal confirms assignment. Still refuse if we never clicked anything
         // (nav-regex lies on an empty status page).
-        if (pathHardWin || optimistic || accepted || !neverActed) {
+        if (pathHardWin || optimistic || accepted || actedSoft || !neverActed) {
           accepted = true;
           outcome = 'accepted';
           via = via || 'verified';
