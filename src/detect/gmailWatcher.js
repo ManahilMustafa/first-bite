@@ -217,72 +217,96 @@ export class GmailWatcher {
       for (const ma of h.messagesAdded || []) messageIds.add(ma.message.id);
     }
 
+    // Fetch + attribute + dispatch every message in this batch concurrently.
+    // A burst of order emails (several vendors' orders landing in the same
+    // poll window) used to be processed one message at a time — message 2's
+    // detection paid message 1's full Gmail API round-trip before it even
+    // started, and detection is exactly the thing FCFS can't afford to queue.
+    // Promise.allSettled isolates one message's failure so it can't stall or
+    // drop the rest of the batch (a single rejection used to abort the whole
+    // pull, including the cursor advance below, and re-fetch everyone next tick).
+    const settled = await Promise.allSettled(
+      [...messageIds].map((id) => this._handleMessage(accessToken, id, centralAddress))
+    );
+
     let handled = 0;
     let unattributed = 0;
-    for (const id of messageIds) {
-      const msg = await this.api(accessToken, `/users/me/messages/${id}?format=full`);
-      const decoded = decodeGmailMessage(msg);
-      const order = parseOrderEmail(decoded);
-      if (!order.isOrder || !order.orderId) continue;
-
-      this.log.info('order detected', { orderId: order.orderId, source: 'gmail', address: order.address });
-
-      const { account, address, via, candidates } = await this._attribute(decoded.headers, centralAddress);
-      if (!account) {
-        // Quarantine: a real order we cannot tie to a registered user. NEVER act
-        // on an order we can't attribute — that would touch the wrong account.
-        unattributed++;
-        this.log.warn('order email could not be attributed to a user', {
-          orderId: order.orderId,
-          candidates: candidates.map((c) => c.address),
-        });
-        if (this.onUnattributed) {
-          try {
-            this.onUnattributed({
-              orderId: order.orderId,
-              address: order.address,
-              state: order.state,
-              zip: order.zip,
-              source: 'gmail',
-              forwardingEmail: candidates[0]?.address || null, // the address we found (e.g. from BCC/forward)
-              via: candidates[0]?.via || null,
-              candidates: candidates.map((c) => c.address),
-            });
-          } catch {
-            /* recording must never break the pull */
-          }
-        }
-        continue;
+    for (const r of settled) {
+      if (r.status === 'fulfilled') {
+        if (r.value === 'handled') handled++;
+        else if (r.value === 'unattributed') unattributed++;
+      } else {
+        this.log.warn('gmail message processing failed', { err: String(r.reason) });
       }
-
-      handled++;
-      this.log.info('order email attributed', {
-        orderId: order.orderId,
-        account: account.label || account.id,
-        forwardedFrom: address,
-        via,
-      });
-      this.onOrder({
-        orderId: order.orderId,
-        acceptUrl: order.acceptUrl,
-        declineUrl: order.declineUrl,
-        address: order.address,
-        zip: order.zip,
-        state: order.state,
-        source: 'gmail',
-        accountId: account.id,
-        forwardingEmail: address,
-        // Gmail's own receipt timestamp for this message — the only honest
-        // anchor for "when did this order actually become available" over
-        // email. Lets handleOrder() measure real detection latency instead of
-        // guessing from our own poll interval.
-        emailReceivedAt: decoded.internalDate,
-      });
     }
 
     // Advance the central cursor.
     if (hist.historyId) await this.saveHistoryId(String(hist.historyId));
     return { handled, unattributed };
+  }
+
+  /**
+   * Fetch, decode, attribute and dispatch ONE message.
+   * @returns {Promise<'handled'|'unattributed'|'skipped'>}
+   */
+  async _handleMessage(accessToken, id, centralAddress) {
+    const msg = await this.api(accessToken, `/users/me/messages/${id}?format=full`);
+    const decoded = decodeGmailMessage(msg);
+    const order = parseOrderEmail(decoded);
+    if (!order.isOrder || !order.orderId) return 'skipped';
+
+    this.log.info('order detected', { orderId: order.orderId, source: 'gmail', address: order.address });
+
+    const { account, address, via, candidates } = await this._attribute(decoded.headers, centralAddress);
+    if (!account) {
+      // Quarantine: a real order we cannot tie to a registered user. NEVER act
+      // on an order we can't attribute — that would touch the wrong account.
+      this.log.warn('order email could not be attributed to a user', {
+        orderId: order.orderId,
+        candidates: candidates.map((c) => c.address),
+      });
+      if (this.onUnattributed) {
+        try {
+          this.onUnattributed({
+            orderId: order.orderId,
+            address: order.address,
+            state: order.state,
+            zip: order.zip,
+            source: 'gmail',
+            forwardingEmail: candidates[0]?.address || null, // the address we found (e.g. from BCC/forward)
+            via: candidates[0]?.via || null,
+            candidates: candidates.map((c) => c.address),
+          });
+        } catch {
+          /* recording must never break the pull */
+        }
+      }
+      return 'unattributed';
+    }
+
+    this.log.info('order email attributed', {
+      orderId: order.orderId,
+      account: account.label || account.id,
+      forwardedFrom: address,
+      via,
+    });
+    this.onOrder({
+      orderId: order.orderId,
+      acceptUrl: order.acceptUrl,
+      declineUrl: order.declineUrl,
+      address: order.address,
+      zip: order.zip,
+      state: order.state,
+      source: 'gmail',
+      accountId: account.id,
+      forwardingEmail: address,
+      // Gmail's own receipt timestamp for this message — the only honest
+      // anchor for "when did this order actually become available" over
+      // email. Lets handleOrder() measure real detection latency instead of
+      // guessing from our own poll interval.
+      emailReceivedAt: decoded.internalDate,
+    });
+    return 'handled';
   }
 
   /**

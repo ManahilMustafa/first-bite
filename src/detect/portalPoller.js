@@ -246,7 +246,13 @@ export class PortalPoller {
           try {
             const address = extractAddressNearOrder(page.body, id);
             const meta = parseAddressMeta(address || '');
-            this.onOrder({
+            // Fire-and-forget on purpose: multiple new orders in one poll must
+            // be dispatched to handleOrder() concurrently, not one at a time,
+            // so order 2 doesn't sit queued behind order 1's whole accept
+            // race. handleOrder() is async, so a rejection here would
+            // otherwise surface as an unhandled promise rejection instead of
+            // a logged error.
+            const result = this.onOrder({
               orderId: id,
               source: 'portal',
               address,
@@ -263,6 +269,9 @@ export class PortalPoller {
                 _otpFetched: page._otpFetched,
               },
             });
+            if (result && typeof result.catch === 'function') {
+              result.catch((e) => this.log.error('onOrder handler rejected', { orderId: id, err: String(e) }));
+            }
           } catch (e) {
             this.log.error('onOrder handler threw', { err: String(e) });
           }
