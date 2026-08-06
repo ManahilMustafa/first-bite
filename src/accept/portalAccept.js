@@ -23,6 +23,7 @@ import {
   looksLikePortalError,
   looksTaken,
 } from './signals.js';
+import { acceptAsIsUrl, extractApprIdNearOrder } from './apprId.js';
 
 /**
  * @param {object} opts
@@ -48,6 +49,7 @@ export async function acceptViaPortal({
   cacheMaxAgeMs = 3000,
   prefetchedPage = null,
   timeoutMs,
+  earlyAsIs = true,
 }) {
   const path = newOrdersPath || session.routes.newOrders;
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
@@ -109,6 +111,25 @@ export async function acceptViaPortal({
         bodySnippet: snippet(html),
       });
       return { ok: false, outcome: 'needs_login', status: pageData.status, bodySnippet: snippet(html), reauthed, otpFetched };
+    }
+
+    // Competitor-style shot: if ApprID is already on the list HTML, fire
+    // Accept=asis BEFORE the list tick. Falls through to list postback on miss.
+    if (earlyAsIs) {
+      const early = await tryEarlyAcceptAsIs({
+        session,
+        orderId,
+        html,
+        log,
+        httpOpts,
+        referer: typeof session.url === 'function' ? session.url(path) : path,
+      });
+      if (early) {
+        return {
+          ...early,
+          timings: { listPostMs: 0, confirmMs: early.timings?.confirmMs || early.durationMs || 0, earlyAsIs: true },
+        };
+      }
     }
 
     const pb = locate(html);
@@ -235,8 +256,22 @@ export async function acceptViaPortal({
       pageUrl = second.url || absPostUrl;
       const detailSteps = ['list_postback', second.via || 'details_postback'];
 
+      // We already POSTed the list tick — never discard for prefetch fallback.
+      // Returning null here caused verify=accepted + dashboard fail (268-08298).
+      if (second._ok === false) {
+        return withTimings({
+          ok: false,
+          outcome: 'error',
+          reason: second.error || 'confirm request failed',
+          status,
+          durationMs,
+          reauthed: nowReauthed,
+          otpFetched: nowOtp,
+          steps: detailSteps,
+        });
+      }
+
       if (looksLikeLogin(resp)) {
-        if (fromCache) return null;
         log.error('accept failed: details Accept redirected to login after retry', {
           orderId,
           status,
@@ -346,7 +381,8 @@ export async function acceptViaPortal({
         steps,
       });
     }
-    if (fromCache) return null;
+    // After a list (and possibly confirm) click, never discard for cache fallback.
+    if (fromCache && !usedDetailsStep) return null;
     log.error('accept failed: unrecognized postback response', { orderId, status, bodySnippet: snippet(resp), steps });
     return withTimings({
       ok: false,
@@ -362,8 +398,9 @@ export async function acceptViaPortal({
 }
 
 /**
- * Race cookie'd GET (URL already has Accept=asis) vs WebForms Accept Appraisal POST.
- * First decisive response wins; otherwise prefer the POST result.
+ * Confirm claim: Prefer Accept=asis GET (fast, no exclusive gate). Only if that
+ * leaves us on the confirm UI, fall back to the heavy WebForms POST.
+ * Parallel POST used to hold the session gate for 2–6s even when GET already lost.
  */
 async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs }) {
   const headers = { referer };
@@ -393,38 +430,157 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
     return false;
   };
 
-  const getP = wrap(
+  const getResult = await wrap(
     'details_get',
     session.http.get(absPostUrl, { followRedirects: true, headers, ...httpOpts })
   );
-  const postP = wrap(
+  if (isDecisive(getResult)) {
+    log.info('confirm accept path settled first', { orderId, via: 'details_get', status: getResult.status });
+    return getResult;
+  }
+
+  log.info('accept: Accept=asis GET not decisive — falling back to Appraisal POST', {
+    orderId,
+    status: getResult.status,
+  });
+  const postResult = await wrap(
     'details_postback',
     session.authedPost(postUrl, detailsBody, { headers, ...httpOpts })
   );
+  if (isDecisive(postResult)) {
+    log.info('confirm accept path settled first', { orderId, via: 'details_postback', status: postResult.status });
+  }
+  return postResult._ok !== false ? postResult : getResult._ok !== false ? getResult : postResult;
+}
 
-  return new Promise((resolve) => {
-    let remaining = 2;
-    /** @type {object[]} */
-    const settled = [];
-    let done = false;
-    const finish = (r) => {
-      if (done) return;
-      done = true;
-      resolve(r);
-    };
-    const onSettle = (r) => {
-      settled.push(r);
-      if (isDecisive(r)) {
-        log.info('confirm accept path settled first', { orderId, via: r.via, status: r.status });
-        return finish(r);
-      }
-      if (--remaining === 0) {
-        finish(settled.find((x) => x.via === 'details_postback') || settled[0]);
-      }
-    };
-    getP.then(onSettle);
-    postP.then(onSettle);
+/**
+ * One-shot Accept=asis when ApprID is visible on the New Orders HTML.
+ * @returns {Promise<object|null>}
+ */
+async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, referer }) {
+  const apprId = extractApprIdNearOrder(html, orderId);
+  if (!apprId) return null;
+
+  const absUrl = acceptAsIsUrl(session, apprId);
+  log.info('accept: early Accept=asis GET (ApprID from list)', { orderId, apprId, url: absUrl });
+  const started = process.hrtime.bigint();
+  let res;
+  try {
+    res = await session.http.get(absUrl, {
+      followRedirects: true,
+      headers: { referer },
+      ...httpOpts,
+    });
+  } catch (e) {
+    log.warn('accept: early Accept=asis failed — using list postback', { orderId, err: String(e) });
+    return null;
+  }
+  const durationMs = Number(process.hrtime.bigint() - started) / 1e6;
+  const body = res.body || '';
+  const status = res.status;
+  const pageUrl = res.url || absUrl;
+  const steps = ['early_asis_get'];
+
+  if (looksLikeLogin(body)) {
+    log.warn('accept: early Accept=asis hit login — using list postback', { orderId });
+    return null;
+  }
+  if (looksLikePortalError(body, pageUrl)) {
+    log.warn('accept: early Accept=asis hit Error.aspx — using list postback', { orderId });
+    return null;
+  }
+  if (looksTaken(body)) {
+    return { ok: false, outcome: 'taken', status, durationMs, steps, reauthed: false, otpFetched: false };
+  }
+  if (looksAccepted(body)) {
+    log.info('accept successful', { orderId, via: 'portal', steps, earlyAsIs: true });
+    return { ok: true, outcome: 'accepted', status, durationMs, steps, reauthed: false, otpFetched: false };
+  }
+
+  // Landed on confirm UI — finish with Appraisal POST only (no list tick).
+  const detailsPb = findDetailsAccept(body, orderId, pageUrl, null);
+  if (!detailsPb) {
+    if (status >= 200 && status < 300 && orderId && body && !body.includes(orderId)) {
+      return { ok: true, outcome: 'submitted', status, durationMs, steps, reauthed: false, otpFetched: false };
+    }
+    log.info('accept: early Accept=asis inconclusive — using list postback', { orderId, status });
+    return null;
+  }
+
+  dumpAcceptDiagnostic({ orderId, stage: 'portal_early_asis_confirm', html: body, url: pageUrl });
+  const postUrl = scrapeFormActionForControl(body, pageUrl, detailsPb.target);
+  if (/&amp;/i.test(postUrl)) return null;
+  const detailsBody = buildControlClick(body, detailsPb);
+  const absPostUrl =
+    typeof session.url === 'function' && !/^https?:/i.test(postUrl) ? session.url(postUrl) : postUrl;
+
+  // Same race as the list-postback confirm step (raceConfirmAccept below):
+  // try the cookie'd Accept=asis GET first — fast, no exclusive gate — and
+  // only fall to the WebForms POST if that's inconclusive. A bare sequential
+  // POST here used to eat the full HTTP timeout (~3s, ACCEPT_HTTP_TIMEOUT_MS)
+  // before this whole early-asis attempt gave up and fell back to list
+  // postback anyway, by which point the order was already gone (production
+  // orders 268-08682/268-08906/268-08993 — see early_confirm POST timeout).
+  const second = await raceConfirmAccept({
+    session,
+    absPostUrl,
+    postUrl,
+    detailsBody,
+    referer: pageUrl,
+    orderId,
+    log,
+    timeoutMs: httpOpts.timeoutMs,
   });
+  if (second._ok === false) {
+    log.warn('accept: early confirm race failed — using list postback', { orderId, err: second.error });
+    return null;
+  }
+  const confirmMs = second.durationMs || 0;
+  const totalMs = durationMs + confirmMs;
+  const resp2 = second.body || '';
+  const status2 = second.status;
+  const steps2 = ['early_asis_get', second.via || 'details_postback'];
+  const url2 = second.url || absPostUrl;
+
+  if (looksLikePortalError(resp2, url2)) return null;
+  if (looksTaken(resp2)) {
+    return {
+      ok: false,
+      outcome: 'taken',
+      status: status2,
+      durationMs: totalMs,
+      steps: steps2,
+      reauthed: !!second._reauthed,
+      otpFetched: !!second._otpFetched,
+      timings: { confirmMs },
+    };
+  }
+  if (looksAccepted(resp2)) {
+    log.info('accept successful', { orderId, via: 'portal', steps: steps2, earlyAsIs: true });
+    return {
+      ok: true,
+      outcome: 'accepted',
+      status: status2,
+      durationMs: totalMs,
+      steps: steps2,
+      reauthed: !!second._reauthed,
+      otpFetched: !!second._otpFetched,
+      timings: { confirmMs },
+    };
+  }
+  if (status2 >= 200 && status2 < 300 && orderId && resp2 && !resp2.includes(orderId)) {
+    return {
+      ok: true,
+      outcome: 'submitted',
+      status: status2,
+      durationMs: totalMs,
+      steps: steps2,
+      reauthed: !!second._reauthed,
+      otpFetched: !!second._otpFetched,
+      timings: { confirmMs },
+    };
+  }
+  return null;
 }
 
 /**
