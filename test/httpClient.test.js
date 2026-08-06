@@ -107,6 +107,35 @@ test('HttpClient rejects cleanly on a malformed compressed body instead of retur
   }
 });
 
+test('HttpClient cancels an in-flight request via AbortSignal instead of waiting it out', async () => {
+  let serverSawRequest = false;
+  const server = await startServer((req, res) => {
+    serverSawRequest = true;
+    // Deliberately slow — the test proves we don't wait for this to finish.
+    const t = setTimeout(() => {
+      res.writeHead(200);
+      res.end('too late');
+    }, 2000);
+    req.on('aborted', () => clearTimeout(t));
+  });
+  const client = new HttpClient();
+  try {
+    const controller = new AbortController();
+    const reqPromise = client.get(urlFor(server), { signal: controller.signal });
+    await new Promise((r) => setTimeout(r, 30)); // let the request actually dispatch
+    assert.equal(serverSawRequest, true);
+
+    const abortedAt = Date.now();
+    controller.abort();
+    await assert.rejects(() => reqPromise, /abort/i);
+    const cancelLatency = Date.now() - abortedAt;
+    assert.ok(cancelLatency < 200, `expected near-instant cancel, took ${cancelLatency}ms`);
+  } finally {
+    client.destroy();
+    await closeServer(server);
+  }
+});
+
 test('gzip round-trip shrinks a VIEWSTATE-shaped page (sanity check for the real win)', async () => {
   // Not asserting a real portal's ratio — just confirming the plumbing gets
   // real bytes-on-the-wire savings on repetitive markup like the WebForms

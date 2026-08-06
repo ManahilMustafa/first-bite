@@ -106,7 +106,7 @@ function messageWithId(id, html = ORDER_EMAIL_HTML) {
 }
 
 test('_pull fetches/attributes/dispatches a batch of new order emails concurrently, not one at a time', async () => {
-  const MESSAGE_LATENCY_MS = 40;
+  const MESSAGE_LATENCY_MS = 80; // generous vs scheduler jitter under a loaded test run
   let inFlight = 0;
   let maxInFlight = 0;
   const messages = { msgA: messageWithId('msgA'), msgB: messageWithId('msgB'), msgC: messageWithId('msgC') };

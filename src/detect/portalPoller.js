@@ -34,8 +34,19 @@ function resolveCooldownMs() {
   return Number.isFinite(n) && n >= 0 ? n : 30 * 60 * 1000;
 }
 
+function resolvePollTimeoutMs() {
+  const n = Number(process.env.PORTAL_POLL_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 4000;
+}
+
+/** True for an intentional client-side cancel (see hold()), never a portal block signal. */
+export function isAbortError(err) {
+  return err?.name === 'AbortError' || err?.code === 'ABORT_ERR';
+}
+
 /** @param {unknown} err */
 export function isBlockSignal(err) {
+  if (isAbortError(err)) return false; // our own cancel, not the portal blocking us
   if (err instanceof PortalHttpError && err.isThrottle) return true;
   if (err && typeof err === 'object' && 'status' in err) {
     const s = /** @type {{status?:number}} */ (err).status;
@@ -59,6 +70,9 @@ export class PortalPoller {
    * @param {number} [opts.cooldownMs]
    * @param {(html:string)=>string[]} [opts.parseOrders] custom order-id extractor
    * @param {string} [opts.newOrdersPath]
+   * @param {number} [opts.timeoutMs] per-poll HTTP timeout — kept tight (default
+   *        4s, PORTAL_POLL_HTTP_TIMEOUT_MS) so a slow poll caps how long it can
+   *        hold the session's exclusive gate away from an accept/decline.
    */
   constructor({
     session,
@@ -69,6 +83,7 @@ export class PortalPoller {
     cooldownMs,
     parseOrders,
     newOrdersPath,
+    timeoutMs,
     log,
   }) {
     this.session = session;
@@ -91,6 +106,7 @@ export class PortalPoller {
     this.intervalMs = requested;
     this.circuitThreshold = circuitThreshold ?? resolveCircuitThreshold();
     this.cooldownMs = cooldownMs ?? resolveCooldownMs();
+    this.timeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : resolvePollTimeoutMs();
 
     this.parseOrders = parseOrders || defaultParseOrders;
     this.newOrdersPath = newOrdersPath || session.routes.newOrders;
@@ -108,12 +124,17 @@ export class PortalPoller {
     this.backoffLevel = 0;
     this.currentBackoffMs = this.intervalMs;
     this._holds = 0;
+    // The AbortController for whichever poll GET is currently in flight, if
+    // any — lets hold() cancel it immediately instead of making an
+    // accept/decline race wait out a read that has nothing to do with it.
+    this._currentAbort = null;
     this.stats = {
       polls: 0,
       errors: 0,
       blockSignals: 0,
       circuitOpens: 0,
       detected: 0,
+      preempted: 0,
       lastPollMs: 0,
     };
   }
@@ -137,10 +158,22 @@ export class PortalPoller {
     this._schedule(0);
   }
 
-  /** Pause ticks while accept/decline owns the portal session (not a circuit). */
+  /**
+   * Pause ticks while accept/decline owns the portal session (not a circuit).
+   * If a poll GET is currently in flight, cancel it immediately instead of
+   * letting the accept/decline race queue behind it on the session's
+   * exclusive HTTP gate — a poll read has no server-side side effect, so
+   * cancelling it client-side costs nothing (the next tick just re-reads the
+   * same list a beat later).
+   */
   hold(reason = 'hold') {
     this._holds = (this._holds || 0) + 1;
     this.log.debug?.('poller hold', { reason, holds: this._holds });
+    if (this._currentAbort) {
+      this.log.debug?.('aborting in-flight poll tick to free the session', { reason });
+      this.stats.preempted++;
+      this._currentAbort.abort();
+    }
   }
 
   release(reason = 'hold') {
@@ -235,8 +268,13 @@ export class PortalPoller {
     const previousPollAt = this._lastPollAt;
     this._lastPollAt = Date.now();
     const t0 = process.hrtime.bigint();
+    const abortController = new AbortController();
+    this._currentAbort = abortController;
     try {
-      const page = await this.session.authedGet(this.newOrdersPath);
+      const page = await this.session.authedGet(this.newOrdersPath, {
+        signal: abortController.signal,
+        timeoutMs: this.timeoutMs,
+      });
       const ids = this.parseOrders(page.body);
       for (const id of ids) {
         if (!this.seen.has(id)) {
@@ -283,6 +321,15 @@ export class PortalPoller {
       this.currentBackoffMs = this.intervalMs;
       this._schedule(this.intervalMs);
     } catch (e) {
+      if (isAbortError(e)) {
+        // Cancelled on purpose by hold() — an accept/decline needed the
+        // session. Not a portal error, not a block signal; just try again
+        // next tick (release() will schedule one immediately once the holder
+        // is done, so this is usually superseded before it even fires).
+        this.log.debug?.('poll tick cancelled (session needed for accept/decline)');
+        this._schedule(this.intervalMs);
+        return;
+      }
       this.stats.errors++;
       if (isBlockSignal(e)) {
         this.stats.blockSignals++;
@@ -307,6 +354,7 @@ export class PortalPoller {
     } finally {
       this.stats.lastPollMs = Number(process.hrtime.bigint() - t0) / 1e6;
       this._running = false;
+      this._currentAbort = null;
     }
   }
 
