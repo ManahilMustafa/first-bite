@@ -115,6 +115,7 @@ export class PortalSession {
    */
   async _exclusive(fn) {
     if (this._gateDepth > 0) return fn();
+    const waitStartedAt = process.hrtime.bigint();
     let release;
     const done = new Promise((r) => {
       release = r;
@@ -122,6 +123,14 @@ export class PortalSession {
     const prev = this._httpGate;
     this._httpGate = done;
     await prev;
+    // Evidence, not guesses: a caller (e.g. an accept/decline race) that had
+    // to wait here was queued behind whatever else held this account's
+    // session — usually an in-flight poll tick. Only log the non-trivial
+    // waits so normal traffic doesn't spam debug output.
+    const gateWaitMs = Number(process.hrtime.bigint() - waitStartedAt) / 1e6;
+    if (gateWaitMs > 50) {
+      this.log.debug('session gate wait', { gateWaitMs: Math.round(gateWaitMs) });
+    }
     this._gateDepth++;
     try {
       return await fn();
@@ -295,20 +304,28 @@ export class PortalSession {
    * retry once on a bare request timeout (the portal is occasionally slow to
    * respond; a single retry is cheap relative to losing the order entirely).
    * Returns the raw HttpClient response.
+   *
+   * `signal` is GET-only on purpose: a poll read has zero server-side side
+   * effect, so cancelling it client-side is free — the portal just finishes
+   * rendering a response nobody reads. An accept/decline POST is never
+   * abortable through this path (authedPost takes no signal) because once a
+   * POST reaches the server it may already be committing the action; killing
+   * the client connection would just make us blind to our own real outcome.
    */
-  async authedGet(path, { retried = false, retriedTimeout = false, timeoutMs } = {}) {
-    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout, timeoutMs }));
+  async authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal } = {}) {
+    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout, timeoutMs, signal }));
   }
 
-  async _authedGet(path, { retried = false, retriedTimeout = false, timeoutMs } = {}) {
+  async _authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal } = {}) {
     if (!this.authenticated) await this.login();
     let res;
     try {
-      res = await this.http.get(this.url(path), { followRedirects: true, timeoutMs });
+      res = await this.http.get(this.url(path), { followRedirects: true, timeoutMs, signal });
     } catch (e) {
+      if (signal?.aborted) throw e; // intentional cancel (e.g. an accept/decline needs the session) — never retry
       if (!retriedTimeout && /timeout/i.test(String(e?.message))) {
         this.log.warn('request timed out, retrying once', { path });
-        const r = await this._authedGet(path, { retried, retriedTimeout: true, timeoutMs });
+        const r = await this._authedGet(path, { retried, retriedTimeout: true, timeoutMs, signal });
         return { ...r, _reauthed: true };
       }
       throw e;
@@ -320,7 +337,7 @@ export class PortalSession {
       this.authenticated = false;
       await this.login();
       this.log.info('login successful — retrying request', { path });
-      const r = await this._authedGet(path, { retried: true, retriedTimeout, timeoutMs });
+      const r = await this._authedGet(path, { retried: true, retriedTimeout, timeoutMs, signal });
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     this._pageCache.set(path, { body: res.body, status: res.status, ts: Date.now() });

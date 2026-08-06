@@ -82,7 +82,7 @@ export class HttpClient {
    * Perform a single request WITHOUT following redirects.
    * Returns { status, headers, body, location, redirected:false, durationMs }.
    */
-  request(urlStr, { method = 'GET', headers = {}, body, followRedirects = false, timeoutMs } = {}) {
+  request(urlStr, { method = 'GET', headers = {}, body, followRedirects = false, timeoutMs, signal } = {}) {
     const startedAt = process.hrtime.bigint();
     const u = new URL(urlStr);
     const isHttps = u.protocol === 'https:';
@@ -113,6 +113,7 @@ export class HttpClient {
           method,
           headers: reqHeaders,
           agent,
+          signal,
         },
         (res) => {
           this.jar.setFromHeaders(u.host, res.headers['set-cookie']);
@@ -157,6 +158,7 @@ export class HttpClient {
                   body: nextMethod === 'GET' || nextMethod === 'HEAD' ? undefined : body,
                   followRedirects,
                   timeoutMs: reqTimeoutMs,
+                  signal,
                 });
                 return resolve({
                   ...r2,

@@ -89,6 +89,120 @@ test('handlePush attributes a forwarded order to the registered user and emits i
   assert.equal(savedHistory, '99');
 });
 
+function messageWithId(id, html = ORDER_EMAIL_HTML) {
+  return {
+    id,
+    payload: {
+      headers: [
+        { name: 'Subject', value: ORDER_EMAIL_SUBJECT },
+        { name: 'To', value: 'notifications@valuelinkams.com' },
+        { name: 'Delivered-To', value: 'central@ops.example.com' },
+        { name: 'Delivered-To', value: 'vendor@gmail.com' },
+        { name: 'X-Forwarded-For', value: 'vendor@gmail.com central@ops.example.com' },
+      ],
+      parts: [{ mimeType: 'text/html', body: { data: b64url(html) } }],
+    },
+  };
+}
+
+test('_pull fetches/attributes/dispatches a batch of new order emails concurrently, not one at a time', async () => {
+  const MESSAGE_LATENCY_MS = 80; // generous vs scheduler jitter under a loaded test run
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const messages = { msgA: messageWithId('msgA'), msgB: messageWithId('msgB'), msgC: messageWithId('msgC') };
+
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes('oauth2.googleapis.com/token')) return jsonResponse({ access_token: 'AT' });
+    if (u.includes('/history')) {
+      return jsonResponse({
+        historyId: '100',
+        history: [
+          {
+            messagesAdded: [
+              { message: { id: 'msgA' } },
+              { message: { id: 'msgB' } },
+              { message: { id: 'msgC' } },
+            ],
+          },
+        ],
+      });
+    }
+    const m = u.match(/\/messages\/(\w+)/);
+    if (m) {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, MESSAGE_LATENCY_MS));
+      inFlight--;
+      return jsonResponse(messages[m[1]]);
+    }
+    throw new Error('unexpected url ' + u);
+  };
+
+  const orders = [];
+  const watcher = new GmailWatcher({
+    oauth: { clientId: 'c', clientSecret: 's' },
+    getRefreshToken: async () => 'RT',
+    resolveUser: (address) =>
+      address === 'vendor@gmail.com' ? { id: 'acct1', label: 'v1', forwardingEmail: 'vendor@gmail.com' } : null,
+    getHistoryId: async () => '50',
+    saveHistoryId: async () => {},
+    onOrder: (o) => orders.push(o),
+    fetchImpl,
+  });
+
+  const startedAt = Date.now();
+  const res = await watcher.handlePush(pushBody());
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(res.handled, 3);
+  assert.equal(orders.length, 3);
+  // 3 messages sequentially would cost >= 3 * MESSAGE_LATENCY_MS just for the
+  // messages.get round-trips. Concurrent dispatch should land close to ONE
+  // round-trip's worth of wall-clock time.
+  assert.ok(
+    elapsedMs < MESSAGE_LATENCY_MS * 2,
+    `expected concurrent fetch (< ${MESSAGE_LATENCY_MS * 2}ms), took ${elapsedMs}ms`
+  );
+  assert.ok(maxInFlight >= 2, `expected overlapping in-flight message fetches, saw max ${maxInFlight}`);
+});
+
+test('_pull isolates one bad message so the rest of the batch and the cursor advance are not lost', async () => {
+  let savedHistory = null;
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes('oauth2.googleapis.com/token')) return jsonResponse({ access_token: 'AT' });
+    if (u.includes('/history')) {
+      return jsonResponse({
+        historyId: '101',
+        history: [{ messagesAdded: [{ message: { id: 'bad' } }, { message: { id: 'good' } }] }],
+      });
+    }
+    if (u.includes('/messages/bad')) return { ok: false, status: 500, json: async () => ({}) };
+    if (u.includes('/messages/good')) return jsonResponse(messageWithId('good'));
+    throw new Error('unexpected url ' + u);
+  };
+
+  const orders = [];
+  const watcher = new GmailWatcher({
+    oauth: { clientId: 'c', clientSecret: 's' },
+    getRefreshToken: async () => 'RT',
+    resolveUser: (address) =>
+      address === 'vendor@gmail.com' ? { id: 'acct1', label: 'v1', forwardingEmail: 'vendor@gmail.com' } : null,
+    getHistoryId: async () => '50',
+    saveHistoryId: async (hid) => {
+      savedHistory = hid;
+    },
+    onOrder: (o) => orders.push(o),
+    fetchImpl,
+  });
+
+  const res = await watcher.handlePush(pushBody());
+  assert.equal(res.handled, 1, 'the good message should still be handled');
+  assert.equal(orders.length, 1);
+  assert.equal(savedHistory, '101', 'cursor should still advance despite one message failing');
+});
+
 test('handlePush quarantines an order it cannot attribute (no emit)', async () => {
   const orders = [];
   const watcher = new GmailWatcher({
