@@ -388,8 +388,11 @@ export class MockPortal {
 
   // ── page renderers ────────────────────────────────────────────────────────--
   _stateFields() {
-    const vs = 'VS_' + randomUUID();
-    const ev = 'EV_' + randomUUID();
+    // Strip hyphens: a raw UUID's hex segments can accidentally collide with
+    // the order-id regex (\d{2,4}-\d{4,6}), e.g. "...5549-4780..." — the
+    // poller then "detects" a phantom order out of its own VIEWSTATE.
+    const vs = 'VS_' + randomUUID().replace(/-/g, '');
+    const ev = 'EV_' + randomUUID().replace(/-/g, '');
     this.issuedViewstate.add(vs);
     this.issuedEventval.add(ev);
     return `

@@ -514,21 +514,32 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, refer
   const absPostUrl =
     typeof session.url === 'function' && !/^https?:/i.test(postUrl) ? session.url(postUrl) : postUrl;
 
-  let second;
-  try {
-    second = await session.authedPost(postUrl, detailsBody, {
-      headers: { referer: pageUrl },
-      ...httpOpts,
-    });
-  } catch (e) {
-    log.warn('accept: early confirm POST failed — using list postback', { orderId, err: String(e) });
+  // Same race as the list-postback confirm step (raceConfirmAccept below):
+  // try the cookie'd Accept=asis GET first — fast, no exclusive gate — and
+  // only fall to the WebForms POST if that's inconclusive. A bare sequential
+  // POST here used to eat the full HTTP timeout (~3s, ACCEPT_HTTP_TIMEOUT_MS)
+  // before this whole early-asis attempt gave up and fell back to list
+  // postback anyway, by which point the order was already gone (production
+  // orders 268-08682/268-08906/268-08993 — see early_confirm POST timeout).
+  const second = await raceConfirmAccept({
+    session,
+    absPostUrl,
+    postUrl,
+    detailsBody,
+    referer: pageUrl,
+    orderId,
+    log,
+    timeoutMs: httpOpts.timeoutMs,
+  });
+  if (second._ok === false) {
+    log.warn('accept: early confirm race failed — using list postback', { orderId, err: second.error });
     return null;
   }
   const confirmMs = second.durationMs || 0;
   const totalMs = durationMs + confirmMs;
   const resp2 = second.body || '';
   const status2 = second.status;
-  const steps2 = ['early_asis_get', 'details_postback'];
+  const steps2 = ['early_asis_get', second.via || 'details_postback'];
   const url2 = second.url || absPostUrl;
 
   if (looksLikePortalError(resp2, url2)) return null;
