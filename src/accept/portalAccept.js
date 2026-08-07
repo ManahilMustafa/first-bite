@@ -25,6 +25,11 @@ import {
 } from './signals.js';
 import { acceptAsIsUrl, extractApprIdNearOrder } from './apprId.js';
 
+function resolveEarlyAsIsTimeoutMs() {
+  const n = Number(process.env.EARLY_ASIS_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 1200;
+}
+
 /**
  * @param {object} opts
  * @param {import('../portal/session.js').PortalSession} opts.session
@@ -50,9 +55,19 @@ export async function acceptViaPortal({
   prefetchedPage = null,
   timeoutMs,
   earlyAsIs = true,
+  earlyAsIsTimeoutMs,
 }) {
   const path = newOrdersPath || session.routes.newOrders;
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
+  // The initial early-asis GET is a "competitor-style shot in the dark" — it
+  // has no race/fallback of its own, so giving it the full accept timeout
+  // (default 3000ms) means a slow/hanging response burns the whole budget
+  // before we even try the reliable list postback. Keep it short: if the
+  // portal doesn't answer fast, assume it won't and fall back sooner
+  // (production orders 268-09310/268-09399/268-09464 lost ~3.3s here).
+  const resolvedEarlyAsIsTimeoutMs = Number.isFinite(earlyAsIsTimeoutMs) && earlyAsIsTimeoutMs > 0
+    ? earlyAsIsTimeoutMs
+    : resolveEarlyAsIsTimeoutMs();
   log.info('accept attempt', { orderId });
 
   const locate = (html) => (locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, acceptLabel));
@@ -122,6 +137,7 @@ export async function acceptViaPortal({
         html,
         log,
         httpOpts,
+        earlyAsIsTimeoutMs: resolvedEarlyAsIsTimeoutMs,
         referer: typeof session.url === 'function' ? session.url(path) : path,
       });
       if (early) {
@@ -457,19 +473,25 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
  * One-shot Accept=asis when ApprID is visible on the New Orders HTML.
  * @returns {Promise<object|null>}
  */
-async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, referer }) {
+async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, earlyAsIsTimeoutMs, referer }) {
   const apprId = extractApprIdNearOrder(html, orderId);
   if (!apprId) return null;
 
   const absUrl = acceptAsIsUrl(session, apprId);
   log.info('accept: early Accept=asis GET (ApprID from list)', { orderId, apprId, url: absUrl });
   const started = process.hrtime.bigint();
+  // Short, dedicated timeout: this probe has no race/fallback of its own, so
+  // it must not burn the full accept timeout before we fall back to the
+  // reliable list postback (see resolveEarlyAsIsTimeoutMs / acceptViaPortal).
+  const earlyHttpOpts = Number.isFinite(earlyAsIsTimeoutMs) && earlyAsIsTimeoutMs > 0
+    ? { ...httpOpts, timeoutMs: earlyAsIsTimeoutMs }
+    : httpOpts;
   let res;
   try {
     res = await session.http.get(absUrl, {
       followRedirects: true,
       headers: { referer },
-      ...httpOpts,
+      ...earlyHttpOpts,
     });
   } catch (e) {
     log.warn('accept: early Accept=asis failed — using list postback', { orderId, err: String(e) });
