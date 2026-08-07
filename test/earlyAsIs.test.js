@@ -7,7 +7,9 @@
 // resolved before its own timeout fired.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { acceptViaPortal } from '../src/accept/portalAccept.js';
+import { PortalSession } from '../src/portal/session.js';
 import { logger } from '../src/util/logger.js';
 
 const ORDER_ID = '900-00099';
@@ -134,4 +136,65 @@ test('early Accept=asis confirm step falls back to POST when the GET is inconclu
 
   assert.equal(postCallCount(), 1, 'an inconclusive GET must still fall back to the POST');
   assert.equal(result.outcome, 'taken'); // TAKEN_HTML is what authedPost resolves with
+});
+
+// ── end-to-end: real PortalSession + HttpClient, not a mock ────────────────────
+// Proves the FIRST early-asis GET actually gets cut off at earlyAsIsTimeoutMs
+// (not the full accept timeout) — this is real timeout enforcement inside
+// node:http, not something a fake session can fake its way past.
+test('a hanging early Accept=asis GET is cut off at earlyAsIsTimeoutMs, not the full accept timeout', async () => {
+  const EARLY_TIMEOUT_MS = 300;
+  const FULL_TIMEOUT_MS = 5000; // deliberately much bigger — proves it's NOT this budget that saves us
+  const SLOW_EARLY_GET_MS = 2000; // longer than EARLY_TIMEOUT_MS, shorter than FULL_TIMEOUT_MS
+
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith('/AcceptBroadcastAppraisal.aspx')) {
+      const t = setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'text/html' });
+        res.end('<html>should never be read — too slow</html>');
+      }, SLOW_EARLY_GET_MS);
+      req.on('aborted', () => clearTimeout(t));
+      return;
+    }
+    // List postback fallback — fast, decisive "taken".
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html>This order is no longer available.</html>');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  try {
+    const { port } = server.address();
+    const session = new PortalSession({ baseUrl: `http://127.0.0.1:${port}`, username: 'u', password: 'p' });
+    session.authenticated = true; // only exercising the accept path here, not login
+
+    const html = `<html><body>
+      <div>Order ${ORDER_ID} <a href="ViewAppraisal.aspx?ApprID=${APPR_ID}">View</a></div>
+      <input type="image" name="imgBtnBroadcastAccept" title="Click here to accept this order" />
+    </body></html>`;
+
+    const startedAt = Date.now();
+    const result = await acceptViaPortal({
+      session,
+      orderId: ORDER_ID,
+      newOrdersPath: '/AppraiserDashboard.aspx',
+      prefetchedPage: { body: html, status: 200, url: `http://127.0.0.1:${port}/AppraiserDashboard.aspx` },
+      log: silentLog(),
+      earlyAsIs: true,
+      timeoutMs: FULL_TIMEOUT_MS,
+      earlyAsIsTimeoutMs: EARLY_TIMEOUT_MS,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.outcome, 'taken'); // resolved via the list-postback fallback
+    assert.ok(
+      elapsedMs < SLOW_EARLY_GET_MS,
+      `expected the early GET to be cut off well before ${SLOW_EARLY_GET_MS}ms, took ${elapsedMs}ms`
+    );
+    assert.ok(
+      elapsedMs >= EARLY_TIMEOUT_MS,
+      `should still take at least the early timeout (${EARLY_TIMEOUT_MS}ms), took ${elapsedMs}ms`
+    );
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
 });
