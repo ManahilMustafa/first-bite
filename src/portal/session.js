@@ -305,27 +305,31 @@ export class PortalSession {
    * respond; a single retry is cheap relative to losing the order entirely).
    * Returns the raw HttpClient response.
    *
-   * `signal` is GET-only on purpose: a poll read has zero server-side side
-   * effect, so cancelling it client-side is free — the portal just finishes
-   * rendering a response nobody reads. An accept/decline POST is never
-   * abortable through this path (authedPost takes no signal) because once a
-   * POST reaches the server it may already be committing the action; killing
-   * the client connection would just make us blind to our own real outcome.
+   * `signal` is safe on any GET: a read has zero server-side side effect, so
+   * cancelling it client-side is free — the portal just finishes rendering a
+   * response nobody reads.
+   *
+   * `noRetryTimeout`: the hot accept path's fresh-page fallback GET has
+   * nothing else to fall back to if it's slow — retrying once just doubles a
+   * loss we already have (production order 268-09791: two back-to-back 3s
+   * timeouts, ~6.2s total, for a race that was over in under 1s either way).
+   * Callers for whom a single fast failure is better than a slower retry pass
+   * this to skip the retry-once behavior.
    */
-  async authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal } = {}) {
-    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout, timeoutMs, signal }));
+  async authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal, noRetryTimeout = false } = {}) {
+    return this._exclusive(() => this._authedGet(path, { retried, retriedTimeout, timeoutMs, signal, noRetryTimeout }));
   }
 
-  async _authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal } = {}) {
+  async _authedGet(path, { retried = false, retriedTimeout = false, timeoutMs, signal, noRetryTimeout = false } = {}) {
     if (!this.authenticated) await this.login();
     let res;
     try {
       res = await this.http.get(this.url(path), { followRedirects: true, timeoutMs, signal });
     } catch (e) {
       if (signal?.aborted) throw e; // intentional cancel (e.g. an accept/decline needs the session) — never retry
-      if (!retriedTimeout && /timeout/i.test(String(e?.message))) {
+      if (!noRetryTimeout && !retriedTimeout && /timeout/i.test(String(e?.message))) {
         this.log.warn('request timed out, retrying once', { path });
-        const r = await this._authedGet(path, { retried, retriedTimeout: true, timeoutMs, signal });
+        const r = await this._authedGet(path, { retried, retriedTimeout: true, timeoutMs, signal, noRetryTimeout });
         return { ...r, _reauthed: true };
       }
       throw e;
@@ -337,27 +341,38 @@ export class PortalSession {
       this.authenticated = false;
       await this.login();
       this.log.info('login successful — retrying request', { path });
-      const r = await this._authedGet(path, { retried: true, retriedTimeout, timeoutMs, signal });
+      const r = await this._authedGet(path, { retried: true, retriedTimeout, timeoutMs, signal, noRetryTimeout });
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     this._pageCache.set(path, { body: res.body, status: res.status, ts: Date.now() });
     return res;
   }
 
-  /** POST a form to an authed page, re-login once on bounce (retries the EXACT
-   *  same body — the caller is responsible for scraping fresh VIEWSTATE via a
-   *  prior authedGet, so a bounce here means the session died between that GET
-   *  and this POST, not that the tokens are stale). */
-  async authedPost(path, body, { retried = false, headers, timeoutMs } = {}) {
-    return this._exclusive(() => this._authedPost(path, body, { retried, headers, timeoutMs }));
+  /**
+   * POST a form to an authed page, re-login once on bounce (retries the EXACT
+   * same body — the caller is responsible for scraping fresh VIEWSTATE via a
+   * prior authedGet, so a bounce here means the session died between that GET
+   * and this POST, not that the tokens are stale).
+   *
+   * `signal` on a POST is a deliberately accepted risk, not a default: once a
+   * POST reaches the server it may already be committing the action, so an
+   * abort here can leave us blind to our own real outcome. Only the
+   * confirm-accept race (raceConfirmAccept in portalAccept.js) uses it, on
+   * the operator's explicit call that losing the FCFS race by waiting is
+   * worse than that risk — and it never retries after an abort, leaning on
+   * verify() (which always runs afterward) as the source of truth instead.
+   */
+  async authedPost(path, body, { retried = false, headers, timeoutMs, signal } = {}) {
+    return this._exclusive(() => this._authedPost(path, body, { retried, headers, timeoutMs, signal }));
   }
 
-  async _authedPost(path, body, { retried = false, headers, timeoutMs } = {}) {
+  async _authedPost(path, body, { retried = false, headers, timeoutMs, signal } = {}) {
     if (!this.authenticated) await this.login();
     const res = await this.http.post(this.url(path), formEncodeObj(body), {
       headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
       followRedirects: true,
       timeoutMs,
+      signal,
     });
     this._assertNotThrottled(res);
     if (this._isBounced(res) && !retried) {
@@ -366,7 +381,7 @@ export class PortalSession {
       this.authenticated = false;
       await this.login();
       this.log.info('login successful — retrying request', { path });
-      const r = await this._authedPost(path, body, { retried: true, headers, timeoutMs });
+      const r = await this._authedPost(path, body, { retried: true, headers, timeoutMs, signal });
       return { ...r, _reauthed: true, _otpFetched: this._lastLoginUsedOtp };
     }
     return res;
