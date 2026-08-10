@@ -31,6 +31,16 @@ const CONFIRM_UI_HTML = `<html><body>
 
 const TAKEN_HTML = `<html><body>This order is no longer available.</body></html>`;
 
+// Real production shape (268-09741/268-09800/268-09831/268-09929): the
+// confirm page's own form action is the EXACT SAME Accept=asis URL we just
+// GET'd to land on it — a second GET there is provably redundant.
+const CONFIRM_UI_SAME_URL_HTML = `<html><body>
+  <form action="/AcceptBroadcastAppraisal.aspx?ApprID=${APPR_ID}&amp;Accept=asis" method="post">
+    <input type="hidden" name="__VIEWSTATE" value="vs" />
+    <input type="submit" name="btnAcceptAppraisal" value="Accept Appraisal" />
+  </form>
+</body></html>`;
+
 function silentLog() {
   const noop = () => {};
   const l = { debug: noop, info: noop, warn: noop, error: noop };
@@ -136,6 +146,45 @@ test('early Accept=asis confirm step falls back to POST when the GET is inconclu
 
   assert.equal(postCallCount(), 1, 'an inconclusive GET must still fall back to the POST');
   assert.equal(result.outcome, 'taken'); // TAKEN_HTML is what authedPost resolves with
+});
+
+test('early Accept=asis confirm step skips the redundant second GET when the form action is the same URL', async () => {
+  let getCallsToAcceptUrl = 0;
+  let postCalls = 0;
+  const session = {
+    url: (path) => `http://fake-portal${path}`,
+    routes: { newOrders: '/AppraiserDashboard.aspx' },
+    http: {
+      get: (url) => {
+        if (url.includes('AcceptBroadcastAppraisal.aspx')) {
+          getCallsToAcceptUrl++;
+          // Real-world shape: the confirm page's form action is THIS SAME URL.
+          return Promise.resolve({ status: 200, url, body: CONFIRM_UI_SAME_URL_HTML, durationMs: 20 });
+        }
+        return Promise.reject(new Error('unexpected GET ' + url));
+      },
+    },
+    authedGet: () => Promise.reject(new Error('authedGet should not be called in this test')),
+    authedPost: (path, body, opts) => {
+      postCalls++;
+      return Promise.resolve({ status: 200, url: path, body: TAKEN_HTML, durationMs: 40 });
+    },
+  };
+
+  const result = await acceptViaPortal({
+    session,
+    orderId: ORDER_ID,
+    prefetchedPage: { body: NEW_ORDERS_HTML, status: 200, url: 'http://fake-portal/AppraiserDashboard.aspx' },
+    log: silentLog(),
+    earlyAsIs: true,
+  });
+
+  assert.equal(result.outcome, 'taken');
+  // Only ONE GET to the Accept=asis URL (the initial probe) — the confirm
+  // step must recognize its form action is the same URL and skip straight
+  // to the POST instead of re-fetching something we already know the answer to.
+  assert.equal(getCallsToAcceptUrl, 1, 'should not re-GET the same Accept=asis URL a second time');
+  assert.equal(postCalls, 1);
 });
 
 // ── end-to-end: real PortalSession + HttpClient, not a mock ────────────────────

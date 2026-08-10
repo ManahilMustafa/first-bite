@@ -417,8 +417,16 @@ export async function acceptViaPortal({
  * Confirm claim: Prefer Accept=asis GET (fast, no exclusive gate). Only if that
  * leaves us on the confirm UI, fall back to the heavy WebForms POST.
  * Parallel POST used to hold the session gate for 2–6s even when GET already lost.
+ *
+ * @param {boolean} [skipGet]  When the confirm page's own form action IS
+ *        absPostUrl (the common case for tryEarlyAcceptAsIs — production
+ *        diagnostics show it's the exact same URL we just GET'd to land on
+ *        this confirm page), a second GET is a guaranteed-redundant repeat of
+ *        an idempotent read: nothing changed, so it can only come back
+ *        non-decisive again. Skip straight to the POST rather than paying
+ *        another ~100-800ms for an answer we already know.
  */
-async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs }) {
+async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs, skipGet = false }) {
   const headers = { referer };
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
 
@@ -446,19 +454,21 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
     return false;
   };
 
-  const getResult = await wrap(
-    'details_get',
-    session.http.get(absPostUrl, { followRedirects: true, headers, ...httpOpts })
-  );
-  if (isDecisive(getResult)) {
-    log.info('confirm accept path settled first', { orderId, via: 'details_get', status: getResult.status });
-    return getResult;
+  let getResult = null;
+  if (!skipGet) {
+    getResult = await wrap(
+      'details_get',
+      session.http.get(absPostUrl, { followRedirects: true, headers, ...httpOpts })
+    );
+    if (isDecisive(getResult)) {
+      log.info('confirm accept path settled first', { orderId, via: 'details_get', status: getResult.status });
+      return getResult;
+    }
+    log.info('accept: Accept=asis GET not decisive — falling back to Appraisal POST', {
+      orderId,
+      status: getResult.status,
+    });
   }
-
-  log.info('accept: Accept=asis GET not decisive — falling back to Appraisal POST', {
-    orderId,
-    status: getResult.status,
-  });
   const postResult = await wrap(
     'details_postback',
     session.authedPost(postUrl, detailsBody, { headers, ...httpOpts })
@@ -466,7 +476,7 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
   if (isDecisive(postResult)) {
     log.info('confirm accept path settled first', { orderId, via: 'details_postback', status: postResult.status });
   }
-  return postResult._ok !== false ? postResult : getResult._ok !== false ? getResult : postResult;
+  return postResult._ok !== false ? postResult : getResult?._ok !== false ? getResult : postResult;
 }
 
 /**
@@ -552,6 +562,11 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, early
     orderId,
     log,
     timeoutMs: httpOpts.timeoutMs,
+    // Production diagnostics (268-09741/268-09800/268-09831/268-09929) show
+    // the confirm page's own form action IS this exact Accept=asis URL — a
+    // second GET here is a guaranteed-redundant repeat of the read we just
+    // did to land on this page. Skip it and go straight to the POST.
+    skipGet: absPostUrl === absUrl,
   });
   if (second._ok === false) {
     log.warn('accept: early confirm race failed — using list postback', { orderId, err: second.error });
