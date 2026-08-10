@@ -30,6 +30,19 @@ function resolveEarlyAsIsTimeoutMs() {
   return Number.isFinite(n) && n > 0 ? n : 1200;
 }
 
+// The confirm-accept POST is capped hard and aborted rather than waited out
+// (production evidence: a consistent ~3s server-side stall on losing orders
+// — see raceConfirmAccept). Deliberate risk, taken on the operator's explicit
+// call: an abort after the request body is already sent doesn't stop the
+// server from processing it, so if it does commit the accept, verify() (which
+// always runs right after) still sees it — we just don't wait around for
+// direct confirmation. Never retried on timeout: a second action attempt
+// risks a duplicate submission, so we trust verify() instead.
+function resolveConfirmPostTimeoutMs() {
+  const n = Number(process.env.CONFIRM_POST_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 1200;
+}
+
 /**
  * @param {object} opts
  * @param {import('../portal/session.js').PortalSession} opts.session
@@ -56,6 +69,7 @@ export async function acceptViaPortal({
   timeoutMs,
   earlyAsIs = true,
   earlyAsIsTimeoutMs,
+  confirmPostTimeoutMs,
 }) {
   const path = newOrdersPath || session.routes.newOrders;
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
@@ -68,6 +82,9 @@ export async function acceptViaPortal({
   const resolvedEarlyAsIsTimeoutMs = Number.isFinite(earlyAsIsTimeoutMs) && earlyAsIsTimeoutMs > 0
     ? earlyAsIsTimeoutMs
     : resolveEarlyAsIsTimeoutMs();
+  const resolvedConfirmPostTimeoutMs = Number.isFinite(confirmPostTimeoutMs) && confirmPostTimeoutMs > 0
+    ? confirmPostTimeoutMs
+    : resolveConfirmPostTimeoutMs();
   log.info('accept attempt', { orderId });
 
   const locate = (html) => (locateAccept ? locateAccept(html, orderId) : locateAcceptForOrder(html, orderId, acceptLabel));
@@ -97,7 +114,10 @@ export async function acceptViaPortal({
   }
 
   const getStarted = process.hrtime.bigint();
-  const page = await session.authedGet(path, httpOpts);
+  // No prefetch/cache was usable — there's nothing else to fall back to here,
+  // so a retry-on-timeout just doubles a loss we already have (production
+  // order 268-09791: two back-to-back 3s timeouts before failing outright).
+  const page = await session.authedGet(path, { ...httpOpts, noRetryTimeout: true });
   const listGetMs = Number(process.hrtime.bigint() - getStarted) / 1e6;
   const result = tag(await attempt(page, { fromCache: false }), 'fresh', { listGetMs });
   if (result) return result;
@@ -138,6 +158,7 @@ export async function acceptViaPortal({
         log,
         httpOpts,
         earlyAsIsTimeoutMs: resolvedEarlyAsIsTimeoutMs,
+        confirmPostTimeoutMs: resolvedConfirmPostTimeoutMs,
         referer: typeof session.url === 'function' ? session.url(path) : path,
       });
       if (early) {
@@ -261,6 +282,7 @@ export async function acceptViaPortal({
         orderId,
         log,
         timeoutMs: httpOpts.timeoutMs,
+        confirmPostTimeoutMs: resolvedConfirmPostTimeoutMs,
       });
       confirmMs = Number(process.hrtime.bigint() - detailsStarted) / 1e6;
       resp = second.body || '';
@@ -426,7 +448,7 @@ export async function acceptViaPortal({
  *        non-decisive again. Skip straight to the POST rather than paying
  *        another ~100-800ms for an answer we already know.
  */
-async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs, skipGet = false }) {
+async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs, skipGet = false, confirmPostTimeoutMs }) {
   const headers = { referer };
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
 
@@ -469,13 +491,37 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
       status: getResult.status,
     });
   }
-  const postResult = await wrap(
-    'details_postback',
-    session.authedPost(postUrl, detailsBody, { headers, ...httpOpts })
-  );
+  // Aborted rather than waited out — see resolveConfirmPostTimeoutMs for why
+  // this is safe enough to accept: verify() is the actual source of truth.
+  const resolvedPostTimeoutMs = Number.isFinite(confirmPostTimeoutMs) && confirmPostTimeoutMs > 0
+    ? confirmPostTimeoutMs
+    : resolveConfirmPostTimeoutMs();
+  const postTimeoutMs = Math.min(resolvedPostTimeoutMs, httpOpts.timeoutMs || Infinity);
+  const postController = new AbortController();
+  const postTimer = setTimeout(() => postController.abort(), postTimeoutMs);
+  let postResult;
+  try {
+    postResult = await wrap(
+      'details_postback',
+      session.authedPost(postUrl, detailsBody, { headers, ...httpOpts, signal: postController.signal })
+    );
+  } finally {
+    clearTimeout(postTimer);
+  }
+  if (postResult._ok === false && postController.signal.aborted) {
+    postResult.timedOut = true;
+    log.warn('accept: confirm POST cut off at postTimeoutMs — not waiting for the portal', {
+      orderId,
+      postTimeoutMs,
+    });
+  }
   if (isDecisive(postResult)) {
     log.info('confirm accept path settled first', { orderId, via: 'details_postback', status: postResult.status });
   }
+  // A timed-out POST must be reported as such — never silently swapped for
+  // the (merely inconclusive, not failed) GET result, or the caller loses
+  // the signal it needs to avoid retrying via list postback.
+  if (postResult.timedOut) return postResult;
   return postResult._ok !== false ? postResult : getResult?._ok !== false ? getResult : postResult;
 }
 
@@ -483,7 +529,7 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
  * One-shot Accept=asis when ApprID is visible on the New Orders HTML.
  * @returns {Promise<object|null>}
  */
-async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, earlyAsIsTimeoutMs, referer }) {
+async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, earlyAsIsTimeoutMs, confirmPostTimeoutMs, referer }) {
   const apprId = extractApprIdNearOrder(html, orderId);
   if (!apprId) return null;
 
@@ -562,6 +608,7 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, early
     orderId,
     log,
     timeoutMs: httpOpts.timeoutMs,
+    confirmPostTimeoutMs,
     // Production diagnostics (268-09741/268-09800/268-09831/268-09929) show
     // the confirm page's own form action IS this exact Accept=asis URL — a
     // second GET here is a guaranteed-redundant repeat of the read we just
@@ -569,6 +616,27 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, early
     skipGet: absPostUrl === absUrl,
   });
   if (second._ok === false) {
+    if (second.timedOut) {
+      // Don't retry via list postback: we don't know whether the server
+      // already committed this accept, and a second action attempt risks a
+      // duplicate submission. verify() (always run by executeAccept right
+      // after this returns) is the source of truth either way — this just
+      // stops us from also waiting on a response we're not going to trust.
+      const totalMsSoFar = durationMs + (second.durationMs || 0);
+      log.warn('accept: early confirm POST timed out — trusting verify() instead of retrying', {
+        orderId,
+        ms: Math.round(totalMsSoFar),
+      });
+      return {
+        ok: true,
+        outcome: 'submitted',
+        status: 0,
+        durationMs: totalMsSoFar,
+        steps: ['early_asis_get', 'details_postback'],
+        reauthed: false,
+        otpFetched: false,
+      };
+    }
     log.warn('accept: early confirm race failed — using list postback', { orderId, err: second.error });
     return null;
   }
