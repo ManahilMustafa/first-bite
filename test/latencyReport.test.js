@@ -96,3 +96,46 @@ test('formatLatencyReport renders a readable report and handles the empty case',
   assert.match(text, /BOTTLENECK/);
   assert.match(text, /Detection latency/);
 });
+
+test('outcomeCounts tallies accepted/declined/failed attempts with rates', () => {
+  const events = [
+    attempt({ accepted: true, declined: false }),
+    attempt({ accepted: true, declined: false }),
+    attempt({ accepted: false, declined: true }),
+    attempt({ accepted: false, declined: false }),
+  ];
+  const report = buildLatencyReport(events);
+  assert.deepEqual(report.outcomeCounts, {
+    accepted: 2,
+    declined: 1,
+    failed: 1,
+    total: 4,
+    acceptRate: 0.5,
+    declineRate: 0.25,
+    failRate: 0.25,
+  });
+});
+
+test('outcomeCounts rates are null (not NaN) for an empty report', () => {
+  const report = buildLatencyReport([]);
+  assert.deepEqual(report.outcomeCounts, {
+    accepted: 0,
+    declined: 0,
+    failed: 0,
+    total: 0,
+    acceptRate: null,
+    declineRate: null,
+    failRate: null,
+  });
+});
+
+test('formatLatencyReport prints the accept/decline/fail rate line', () => {
+  const events = [
+    attempt({ accepted: true, declined: false }),
+    attempt({ accepted: false, declined: false }),
+  ];
+  const text = formatLatencyReport(buildLatencyReport(events));
+  assert.match(text, /1 accepted \(50\.0%\)/);
+  assert.match(text, /0 declined \(0\.0%\)/);
+  assert.match(text, /1 failed \(50\.0%\)/);
+});

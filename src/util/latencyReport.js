@@ -59,6 +59,8 @@ function stageSummaries(attempts) {
  *   stages: object,
  *   bySource: {gmail: object, portal: object},
  *   byResult: {accepted: object, declined: object, failed: object},
+ *   outcomeCounts: {accepted:number, declined:number, failed:number, total:number,
+ *     acceptRate:number|null, declineRate:number|null, failRate:number|null},
  *   bottleneck: {key:string, label:string, p50:number}|null,
  * }}
  */
@@ -68,6 +70,25 @@ export function buildLatencyReport(events) {
   const attempts = events.filter((e) => e.action === 'accept' || e.action === 'decline');
 
   const stages = stageSummaries(attempts);
+
+  // Per-attempt, not per-order: a lost order is commonly detected (and
+  // attempted) by both the portal poller and the Gmail watcher, so a loss can
+  // contribute two rows here while a win usually contributes one (the lock is
+  // only released — letting a second detector retry — when the first attempt
+  // did NOT accept). Treat this as a lower bound on the true per-order win
+  // rate, not an exact one.
+  const acceptedCount = attempts.filter((e) => e.accepted).length;
+  const declinedCount = attempts.filter((e) => e.declined).length;
+  const failedCount = attempts.length - acceptedCount - declinedCount;
+  const outcomeCounts = {
+    accepted: acceptedCount,
+    declined: declinedCount,
+    failed: failedCount,
+    total: attempts.length,
+    acceptRate: attempts.length ? acceptedCount / attempts.length : null,
+    declineRate: attempts.length ? declinedCount / attempts.length : null,
+    failRate: attempts.length ? failedCount / attempts.length : null,
+  };
 
   const bySource = {
     gmail: stageSummaries(attempts.filter((e) => e.source === 'gmail')),
@@ -92,7 +113,7 @@ export function buildLatencyReport(events) {
     }
   }
 
-  return { sampleSize: attempts.length, stages, bySource, byResult, bottleneck };
+  return { sampleSize: attempts.length, stages, bySource, byResult, outcomeCounts, bottleneck };
 }
 
 function fmt(ms) {
@@ -121,6 +142,17 @@ export function formatLatencyReport(report) {
     lines.push('No real attempts with latency data yet.');
     return lines.join('\n');
   }
+  const oc = report.outcomeCounts;
+  if (oc) {
+    const pct = (r) => (r == null ? 'n/a' : `${(r * 100).toFixed(1)}%`);
+    lines.push('');
+    lines.push(
+      `Outcome (per attempt, not per order — a loss is often logged twice, once per detector): ` +
+        `${oc.accepted} accepted (${pct(oc.acceptRate)}), ${oc.declined} declined (${pct(oc.declineRate)}), ` +
+        `${oc.failed} failed (${pct(oc.failRate)}) of ${oc.total}`
+    );
+  }
+
   lines.push('');
   lines.push('Overall:');
   lines.push(...formatStageTable(report.stages));
