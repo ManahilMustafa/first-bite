@@ -234,6 +234,19 @@ export class PortalPoller {
     this._timer.unref?.();
   }
 
+  /**
+   * Fixed-rate scheduling for the common (successful-tick) case: the next
+   * tick fires `intervalMs` after THIS tick STARTED, not `intervalMs` after
+   * it finished. A plain `_schedule(this.intervalMs)` here is fixed-delay —
+   * on a tick whose own GET round-trip takes ~500ms, the real gap between
+   * ticks becomes intervalMs + 500ms, not intervalMs (production evidence:
+   * 300ms configured, ~800ms observed p50 portal detection latency).
+   */
+  _scheduleNextTick(t0) {
+    const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
+    this._schedule(Math.max(0, this.intervalMs - elapsedMs));
+  }
+
   _clearPollTimer() {
     if (this._timer) {
       clearTimeout(this._timer);
@@ -319,7 +332,7 @@ export class PortalPoller {
       this.consecutiveBlockErrors = 0;
       this.backoffLevel = 0;
       this.currentBackoffMs = this.intervalMs;
-      this._schedule(this.intervalMs);
+      this._scheduleNextTick(t0);
     } catch (e) {
       if (isAbortError(e)) {
         // Cancelled on purpose by hold() — an accept/decline needed the
