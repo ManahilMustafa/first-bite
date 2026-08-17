@@ -12,6 +12,20 @@ import {
 } from '../portal/aspnet.js';
 import { looksAccepted, looksAvailable, looksTaken } from './signals.js';
 
+// Each GET/POST here defaults to the HttpClient's full 10s timeout, and
+// authedGet/authedPost retry once on timeout — so a single verify() call
+// could silently cost up to ~40s (status + newOrders + inProgress, each up
+// to 2x10s) before ever reaching acceptExecutor's own verifyWithRetries loop,
+// which then calls verify() again up to 3 more times. Production evidence:
+// portal-source verify duration p50 ~10s, max ~15.7s. Bound each request
+// instead — a timeout here still gets its one retry (an actual answer beats
+// a fast 'unknown', which the dashboard treats as an under-report), it's
+// just not allowed to eat the whole hot path.
+function resolveVerifyTimeoutMs() {
+  const n = Number(process.env.VERIFY_HTTP_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 2500;
+}
+
 /**
  * @param {import('../portal/session.js').PortalSession} session
  * @returns {(orderId:string)=>Promise<'accepted'|'taken'|'available'|'unknown'>}
@@ -19,11 +33,12 @@ import { looksAccepted, looksAvailable, looksTaken } from './signals.js';
 export function makePortalVerifier(session) {
   return async function verify(orderId) {
     if (!orderId) return 'unknown';
+    const timeoutMs = resolveVerifyTimeoutMs();
 
     // 1) Dedicated status route (when the portal actually implements it).
     if (typeof session.routes?.status === 'function') {
       try {
-        const res = await session.authedGet(session.routes.status(orderId));
+        const res = await session.authedGet(session.routes.status(orderId), { timeoutMs });
         const hit = classifyStatusHtml(res.body || '', orderId);
         if (hit) return hit;
       } catch {
@@ -33,7 +48,7 @@ export function makePortalVerifier(session) {
 
     // 2) New Orders — if our Accept tick is still there, we did NOT win.
     try {
-      const page = await session.authedGet(session.routes.newOrders);
+      const page = await session.authedGet(session.routes.newOrders, { timeoutMs });
       const html = page.body || '';
       const onNew = classifyNearOrder(html, orderId);
       if (onNew === 'available') return 'available';
@@ -42,7 +57,7 @@ export function makePortalVerifier(session) {
 
       // 3) Order left New Orders → check In Progress list (real E-Street home).
       if (!html.includes(orderId)) {
-        const inProg = await fetchInProgressHtml(session, html);
+        const inProg = await fetchInProgressHtml(session, html, timeoutMs);
         if (inProg) {
           const hit = classifyNearOrder(inProg, orderId);
           if (hit) return hit;
@@ -94,7 +109,7 @@ export function classifyNearOrder(html, orderId) {
 }
 
 /** Best-effort: post the "In Progress Orders" nav link from the current page. */
-async function fetchInProgressHtml(session, newOrdersHtml) {
+async function fetchInProgressHtml(session, newOrdersHtml, timeoutMs) {
   const pb =
     findPostbackTarget(newOrdersHtml, /in\s*progress\s*orders/i) ||
     findPostbackTarget(newOrdersHtml, /show\s*in\s*progress/i);
@@ -103,7 +118,7 @@ async function fetchInProgressHtml(session, newOrdersHtml) {
   if (!/InProgress|ShowInProgress|inprogress/i.test(tgt)) return null;
   try {
     const body = buildControlClick(newOrdersHtml, pb);
-    const res = await session.authedPost(session.routes.newOrders, body);
+    const res = await session.authedPost(session.routes.newOrders, body, { timeoutMs });
     return res.body || '';
   } catch {
     return null;
