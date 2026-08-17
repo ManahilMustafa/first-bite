@@ -361,18 +361,59 @@ test('executor does NOT claim accept when verify still shows available', async (
 });
 
 test('executor does NOT claim accept on optimistic submitted + verify unknown', async () => {
-  portal.addOrder('266-03338');
-  const s = session();
-  const r = await executeAccept({
-    orderId: '266-03338',
-    session: s,
-    portalAcceptFn: async () => ({ ok: true, outcome: 'submitted', status: 200 }),
-    verify: async () => 'unknown',
-  });
-  assert.equal(r.accepted, false, 'soft 2xx without verify must not become accepted');
-  assert.equal(r.outcome, 'unverified');
-  assert.equal(portal.orderStatus('266-03338'), 'available');
-  s.close();
+  const prevCount = process.env.VERIFY_RETRY_COUNT;
+  process.env.VERIFY_RETRY_COUNT = '0';
+  try {
+    portal.addOrder('266-03338');
+    const s = session();
+    const r = await executeAccept({
+      orderId: '266-03338',
+      session: s,
+      portalAcceptFn: async () => ({ ok: true, outcome: 'submitted', status: 200 }),
+      verify: async () => 'unknown',
+    });
+    assert.equal(r.accepted, false, 'soft 2xx without verify must not become accepted');
+    assert.equal(r.outcome, 'unverified');
+    assert.equal(portal.orderStatus('266-03338'), 'available');
+    s.close();
+  } finally {
+    if (prevCount === undefined) delete process.env.VERIFY_RETRY_COUNT;
+    else process.env.VERIFY_RETRY_COUNT = prevCount;
+  }
+});
+
+test('executor retries verify after soft submit until accepted (portal lag)', async () => {
+  const prevCount = process.env.VERIFY_RETRY_COUNT;
+  const prevMs = process.env.VERIFY_RETRY_MS;
+  process.env.VERIFY_RETRY_COUNT = '3';
+  process.env.VERIFY_RETRY_MS = '10';
+  try {
+    const s = session();
+    let calls = 0;
+    const r = await executeAccept({
+      orderId: '266-03381',
+      session: s,
+      portalAcceptFn: async () => ({
+        ok: true,
+        outcome: 'submitted',
+        status: 0,
+        steps: ['early_asis_get', 'details_postback'],
+      }),
+      verify: async () => {
+        calls++;
+        return calls < 3 ? 'unknown' : 'accepted';
+      },
+    });
+    assert.equal(r.accepted, true);
+    assert.equal(r.outcome, 'accepted');
+    assert.ok(calls >= 3, `expected verify retries, got ${calls}`);
+    s.close();
+  } finally {
+    if (prevCount === undefined) delete process.env.VERIFY_RETRY_COUNT;
+    else process.env.VERIFY_RETRY_COUNT = prevCount;
+    if (prevMs === undefined) delete process.env.VERIFY_RETRY_MS;
+    else process.env.VERIFY_RETRY_MS = prevMs;
+  }
 });
 
 test('executor does NOT mark dashboard Accepted when verify is unknown', async () => {

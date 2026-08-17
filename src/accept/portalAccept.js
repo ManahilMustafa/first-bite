@@ -30,17 +30,20 @@ function resolveEarlyAsIsTimeoutMs() {
   return Number.isFinite(n) && n > 0 ? n : 1200;
 }
 
-// The confirm-accept POST is capped hard and aborted rather than waited out
-// (production evidence: a consistent ~3s server-side stall on losing orders
-// — see raceConfirmAccept). Deliberate risk, taken on the operator's explicit
-// call: an abort after the request body is already sent doesn't stop the
-// server from processing it, so if it does commit the accept, verify() (which
-// always runs right after) still sees it — we just don't wait around for
-// direct confirmation. Never retried on timeout: a second action attempt
-// risks a duplicate submission, so we trust verify() instead.
+// Soft ceiling for how long the hot path waits on the confirm POST before
+// returning `submitted` and letting verify() decide. The POST itself is NOT
+// aborted (Node abort destroys the socket and can cancel IIS work mid-commit —
+// production 268-11027/11023/11046 all aborted then verified unknown; the one
+// win that survived abort, 268-10359, was lucky). Background POST keeps running
+// under the session exclusive gate so verify serializes behind it and sees a
+// fresher portal. Never retried on timeout: a second action risks a duplicate.
 function resolveConfirmPostTimeoutMs() {
   const n = Number(process.env.CONFIRM_POST_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? n : 1200;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -297,6 +300,22 @@ export async function acceptViaPortal({
       // We already POSTed the list tick — never discard for prefetch fallback.
       // Returning null here caused verify=accepted + dashboard fail (268-08298).
       if (second._ok === false) {
+        if (second.timedOut) {
+          // Same contract as early-asis: optimistic submitted, verify decides.
+          log.warn('accept: list-path confirm POST soft-timeout — trusting verify() instead of retrying', {
+            orderId,
+            ms: Math.round(durationMs),
+          });
+          return withTimings({
+            ok: true,
+            outcome: 'submitted',
+            status: 0,
+            durationMs,
+            reauthed: nowReauthed,
+            otpFetched: nowOtp,
+            steps: detailSteps,
+          });
+        }
         return withTimings({
           ok: false,
           outcome: 'error',
@@ -491,37 +510,40 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
       status: getResult.status,
     });
   }
-  // Aborted rather than waited out — see resolveConfirmPostTimeoutMs for why
-  // this is safe enough to accept: verify() is the actual source of truth.
+  // Soft-timeout (no AbortController): see resolveConfirmPostTimeoutMs.
   const resolvedPostTimeoutMs = Number.isFinite(confirmPostTimeoutMs) && confirmPostTimeoutMs > 0
     ? confirmPostTimeoutMs
     : resolveConfirmPostTimeoutMs();
   const postTimeoutMs = Math.min(resolvedPostTimeoutMs, httpOpts.timeoutMs || Infinity);
-  const postController = new AbortController();
-  const postTimer = setTimeout(() => postController.abort(), postTimeoutMs);
-  let postResult;
-  try {
-    postResult = await wrap(
-      'details_postback',
-      session.authedPost(postUrl, detailsBody, { headers, ...httpOpts, signal: postController.signal })
-    );
-  } finally {
-    clearTimeout(postTimer);
-  }
-  if (postResult._ok === false && postController.signal.aborted) {
-    postResult.timedOut = true;
-    log.warn('accept: confirm POST cut off at postTimeoutMs — not waiting for the portal', {
+  const postPromise = wrap(
+    'details_postback',
+    // No signal — keep the socket alive so the portal can finish committing.
+    session.authedPost(postUrl, detailsBody, { headers, ...httpOpts })
+  );
+  const postResult = await Promise.race([
+    postPromise,
+    sleep(postTimeoutMs).then(() => ({
+      status: 0,
+      body: '',
+      durationMs: postTimeoutMs,
+      via: 'details_postback',
+      _ok: false,
+      timedOut: true,
+      error: `confirm POST soft-timeout after ${postTimeoutMs}ms`,
+    })),
+  ]);
+  if (postResult.timedOut) {
+    // Leave postPromise running (session exclusive holds until it settles).
+    postPromise.catch(() => {});
+    log.warn('accept: confirm POST soft-timeout — leaving request in flight, trusting verify()', {
       orderId,
       postTimeoutMs,
     });
+    return postResult;
   }
   if (isDecisive(postResult)) {
     log.info('confirm accept path settled first', { orderId, via: 'details_postback', status: postResult.status });
   }
-  // A timed-out POST must be reported as such — never silently swapped for
-  // the (merely inconclusive, not failed) GET result, or the caller loses
-  // the signal it needs to avoid retrying via list postback.
-  if (postResult.timedOut) return postResult;
   return postResult._ok !== false ? postResult : getResult?._ok !== false ? getResult : postResult;
 }
 
@@ -620,10 +642,10 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, early
       // Don't retry via list postback: we don't know whether the server
       // already committed this accept, and a second action attempt risks a
       // duplicate submission. verify() (always run by executeAccept right
-      // after this returns) is the source of truth either way — this just
-      // stops us from also waiting on a response we're not going to trust.
+      // after this returns) is the source of truth either way — soft-timeout
+      // leaves the POST in flight under the session exclusive gate.
       const totalMsSoFar = durationMs + (second.durationMs || 0);
-      log.warn('accept: early confirm POST timed out — trusting verify() instead of retrying', {
+      log.warn('accept: early confirm POST soft-timeout — trusting verify() instead of retrying', {
         orderId,
         ms: Math.round(totalMsSoFar),
       });

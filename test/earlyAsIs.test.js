@@ -88,9 +88,8 @@ function makeFakeSession({ postBehavior = 'hang', postDelayMs = 5000 } = {}) {
           setTimeout(() => resolve({ status: 200, url: path, body: TAKEN_HTML, durationMs: postDelayMs }), postDelayMs)
         );
       }
-      // Simulates the real failure: this request never resolves on its own
-      // (like the ~3s portal stall in production) — only settles if the
-      // caller's AbortController cuts it off, same as the real HttpClient.
+      // Simulates a slow portal confirm POST. Soft-timeout leaves this running
+      // (no AbortController) — the race returns timedOut while this hangs.
       return new Promise((resolve, reject) => {
         const t = setTimeout(() => reject(new Error(`Request timeout: ${path}`)), postDelayMs);
         opts?.signal?.addEventListener('abort', () => {
@@ -156,7 +155,7 @@ test('early Accept=asis confirm step falls back to POST when the GET is inconclu
   assert.equal(result.outcome, 'taken'); // TAKEN_HTML is what authedPost resolves with
 });
 
-test('a hanging confirm POST is aborted at confirmPostTimeoutMs and trusts verify() instead of retrying', async () => {
+test('a hanging confirm POST soft-times out at confirmPostTimeoutMs and trusts verify() instead of retrying', async () => {
   const CONFIRM_POST_TIMEOUT_MS = 150;
   const { session, postCallCount } = makeFakeSession({ postBehavior: 'hang', postDelayMs: 10000 });
   // Make the confirm-race GET inconclusive so the race must fall through to
@@ -181,8 +180,8 @@ test('a hanging confirm POST is aborted at confirmPostTimeoutMs and trusts verif
   const elapsedMs = Date.now() - startedAt;
 
   // Resolved near confirmPostTimeoutMs, nowhere near the 10s the POST was
-  // configured to hang for — proves the abort actually cut it off.
-  assert.ok(elapsedMs < 1000, `expected abort around ${CONFIRM_POST_TIMEOUT_MS}ms, took ${elapsedMs}ms`);
+  // configured to hang for — proves soft-timeout returned without waiting.
+  assert.ok(elapsedMs < 1000, `expected soft-timeout around ${CONFIRM_POST_TIMEOUT_MS}ms, took ${elapsedMs}ms`);
   assert.equal(postCallCount(), 1, 'the POST should have been attempted exactly once');
   // Optimistic "submitted", not a hard failure and not a claimed win — verify()
   // (run by executeAccept, not exercised by acceptViaPortal alone) decides.
@@ -291,11 +290,13 @@ test('a hanging early Accept=asis GET is cut off at earlyAsIsTimeoutMs, not the 
   }
 });
 
-test('a hanging confirm POST is really aborted over the wire (real HttpClient), not just in a fake', async () => {
+test('a hanging confirm POST soft-times out without aborting the socket (real HttpClient)', async () => {
   const CONFIRM_POST_TIMEOUT_MS = 250;
-  const SLOW_POST_MS = 4000; // server never answers within this — proves the abort, not a lucky fast server
+  const SLOW_POST_MS = 800; // slower than soft-timeout, faster than accept HTTP timeout
 
   let postReceived = false;
+  let postAborted = false;
+  let postCompleted = false;
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url.startsWith('/AcceptBroadcastAppraisal.aspx')) {
       res.writeHead(200, { 'content-type': 'text/html' });
@@ -309,10 +310,14 @@ test('a hanging confirm POST is really aborted over the wire (real HttpClient), 
     if (req.method === 'POST') {
       postReceived = true;
       const t = setTimeout(() => {
+        postCompleted = true;
         res.writeHead(200, { 'content-type': 'text/html' });
-        res.end('<html>should never be read — too slow</html>');
+        res.end('<html>Order accepted by vendor — In Progress</html>');
       }, SLOW_POST_MS);
-      req.on('aborted', () => clearTimeout(t));
+      req.on('aborted', () => {
+        postAborted = true;
+        clearTimeout(t);
+      });
       return;
     }
     res.writeHead(404);
@@ -347,8 +352,13 @@ test('a hanging confirm POST is really aborted over the wire (real HttpClient), 
     assert.equal(result.outcome, 'submitted');
     assert.ok(
       elapsedMs < SLOW_POST_MS,
-      `expected the POST to be aborted well before ${SLOW_POST_MS}ms, took ${elapsedMs}ms`
+      `expected soft-timeout well before ${SLOW_POST_MS}ms, took ${elapsedMs}ms`
     );
+
+    // Socket must stay alive so the portal can finish committing.
+    await new Promise((r) => setTimeout(r, SLOW_POST_MS + 200));
+    assert.equal(postAborted, false, 'confirm POST must not be aborted on soft-timeout');
+    assert.equal(postCompleted, true, 'background POST should complete after soft-timeout returns');
   } finally {
     await new Promise((r) => server.close(r));
   }

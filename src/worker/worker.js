@@ -17,6 +17,20 @@ import { orderLockKey } from '../lock/lock.js';
 import { orderMatchesRegion } from '../util/regionFilter.js';
 import { logger } from '../util/logger.js';
 
+/**
+ * Keep the exactly-once lock after a soft confirm submit even if verify is still
+ * unknown. Releasing let Gmail re-fire Accept on the same order (production
+ * 268-11027/11023 → second attempt already `taken`). Lock TTL still expires.
+ */
+export function shouldRetainOrderLock(event) {
+  if (event?.accepted || event?.declined) return true;
+  if (event?.action !== 'accept' || event?.outcome !== 'unverified') return false;
+  const portal = event.paths?.portal;
+  if (portal?.outcome === 'submitted') return true;
+  if (Array.isArray(portal?.steps) && portal.steps.includes('details_postback')) return true;
+  return false;
+}
+
 export class AccountWorker {
   /**
    * @param {object} opts
@@ -194,7 +208,7 @@ export class AccountWorker {
       totalMs,
     };
 
-    const acted = event.accepted || event.declined;
+    const acted = event.accepted || event.declined || shouldRetainOrderLock(event);
     if (!acted) await this.lock.release(key);
 
     return this._report(event);
