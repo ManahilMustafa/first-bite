@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { MemoryLock } from '../src/lock/memoryLock.js';
 import { encrypt, decrypt, encryptFields, decryptFields, resolveKey } from '../src/util/crypto.js';
 import { CookieJar } from '../src/util/httpClient.js';
+import { shouldRetainOrderLock } from '../src/worker/worker.js';
 import {
   scrapeHiddenFields,
   buildPostback,
@@ -15,6 +16,28 @@ import {
 } from '../src/portal/aspnet.js';
 
 const KEY = resolveKey(Buffer.alloc(32, 7).toString('base64'));
+
+test('shouldRetainOrderLock keeps lock after soft confirm + unverified', () => {
+  assert.equal(
+    shouldRetainOrderLock({
+      action: 'accept',
+      accepted: false,
+      outcome: 'unverified',
+      paths: { portal: { outcome: 'submitted', steps: ['early_asis_get', 'details_postback'] } },
+    }),
+    true
+  );
+  assert.equal(
+    shouldRetainOrderLock({
+      action: 'accept',
+      accepted: false,
+      outcome: 'taken',
+      paths: { portal: { outcome: 'taken' } },
+    }),
+    false
+  );
+  assert.equal(shouldRetainOrderLock({ accepted: true }), true);
+});
 
 // ── crypto ──────────────────────────────────────────────────────────────────
 test('crypto round-trips and ciphertext is not plaintext', () => {

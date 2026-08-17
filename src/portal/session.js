@@ -356,11 +356,10 @@ export class PortalSession {
    *
    * `signal` on a POST is a deliberately accepted risk, not a default: once a
    * POST reaches the server it may already be committing the action, so an
-   * abort here can leave us blind to our own real outcome. Only the
-   * confirm-accept race (raceConfirmAccept in portalAccept.js) uses it, on
-   * the operator's explicit call that losing the FCFS race by waiting is
-   * worse than that risk — and it never retries after an abort, leaning on
-   * verify() (which always runs afterward) as the source of truth instead.
+   * abort here can cancel IIS work mid-commit. The confirm-accept race
+   * (raceConfirmAccept in portalAccept.js) therefore soft-times out WITHOUT
+   * aborting — it returns `submitted` and lets verify() decide while the POST
+   * keeps running under this exclusive gate.
    */
   async authedPost(path, body, { retried = false, headers, timeoutMs, signal } = {}) {
     return this._exclusive(() => this._authedPost(path, body, { retried, headers, timeoutMs, signal }));

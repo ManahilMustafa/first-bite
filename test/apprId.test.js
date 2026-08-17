@@ -2,6 +2,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { extractApprIdNearOrder, acceptAsIsUrl } from '../src/accept/apprId.js';
 
+test('extractApprIdNearOrder finds ViewAppraisal link beside order id', () => {
+  const html = `
+    <tr><td><a href="ViewAppraisal.aspx?ApprID=262600">268-08547</a></td>
+    <td><input type="image" name="ctl00$cphBody$grdNewOrders$ctl02$imgBtnBroadcastAccept$268-08547" title="accept" /></td></tr>
+  `;
+  assert.equal(extractApprIdNearOrder(html, '268-08547'), '262600');
+});
+
 test('extractApprIdNearOrder picks the nearest ApprID, not the first one in the window', () => {
   // Two orders share the same 2000-char window; the neighbor's link (wrong
   // ApprID) sits before our order's own link (correct ApprID) in scan order —

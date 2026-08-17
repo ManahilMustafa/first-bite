@@ -35,6 +35,7 @@ export class MockPortal {
     this.emailOtpRequired = false; // simulate the real deployment's mandatory email-OTP step
     this.otpCode = '123456';
     this.pendingAuth = new Map(); // pending-auth cookie -> username (post-password, pre-OTP)
+    this._nextApprId = 250000;
     this.server = http.createServer((req, res) => {
       this._handle(req, res).catch((e) => {
         if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' });
@@ -61,8 +62,9 @@ export class MockPortal {
   addUser(username, password) {
     this.users.set(username, password);
   }
-  addOrder(id, { address = '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613', emailOwner } = {}) {
-    this.orders.set(id, { id, status: 'available', acceptedBy: null, address });
+  addOrder(id, { address = '8140 NIGHTINGALE RD WEEKI WACHEE FL 34613', emailOwner, apprId } = {}) {
+    const resolvedApprId = String(apprId || this._nextApprId++);
+    this.orders.set(id, { id, status: 'available', acceptedBy: null, address, apprId: resolvedApprId });
     if (!this.orderTokens.has(id)) {
       // The email accept link is tokenized to a specific vendor (the recipient).
       const owner = emailOwner || [...this.users.keys()][0];
@@ -216,7 +218,10 @@ export class MockPortal {
           if (!order) return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
           if (order.status === 'accepted')
             return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
-          return html(res, 200, this._orderDetailsPage(orderId, order.address, { acceptLabel: 'Accept Order' }));
+          return html(res, 200, this._orderDetailsPage(orderId, order.address, {
+            acceptLabel: 'Accept Order',
+            formAction: '/decline.aspx',
+          }));
         }
         const d = this._tryDecline(orderId, sessionUser, 'portal');
         if (d.ok) return html(res, 200, this._messagePage(`Order ${orderId} declined.`));
@@ -229,7 +234,10 @@ export class MockPortal {
         if (!order) return html(res, 200, this._messagePage(`Order ${orderId} not found.`));
         if (order.status === 'accepted')
           return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
-        return html(res, 200, this._orderDetailsPage(orderId, order.address, { acceptLabel: 'Accept Appraisal' }));
+        return html(res, 200, this._orderDetailsPage(orderId, order.address, {
+          acceptLabel: 'Accept Appraisal',
+          formAction: `./AcceptBroadcastAppraisal.aspx?ApprID=${order.apprId}&Accept=asis`,
+        }));
       }
       const r = this._tryAccept(orderId, sessionUser, 'portal');
       if (r.ok) return html(res, 200, this._acceptSuccessPage(orderId));
@@ -257,7 +265,10 @@ export class MockPortal {
         if (order.status === 'accepted') {
           return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
         }
-        return html(res, 200, this._orderDetailsPage(id, order.address, { acceptLabel: 'Accept Order' }));
+        return html(res, 200, this._orderDetailsPage(id, order.address, {
+          acceptLabel: 'Accept Order',
+          formAction: '/accept.aspx',
+        }));
       }
       const r = this._tryAccept(id, rec.user, 'email');
       if (r.ok) return html(res, 200, this._acceptSuccessPage(id));
@@ -314,6 +325,44 @@ export class MockPortal {
       if (r.reason === 'taken')
         return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
       return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
+    }
+
+    // Accept=asis (email-link shape) + confirm-page POST — real portal URL.
+    if (/^\/Accept(?:Broadcast)?Appraisal\.aspx$/i.test(path)) {
+      const apprId = u.searchParams.get('ApprID');
+      const order = [...this.orders.values()].find((o) => String(o.apprId) === String(apprId));
+      const orderId = order?.id;
+      if (req.method === 'GET' && String(u.searchParams.get('Accept') || '').toLowerCase() === 'asis') {
+        if (!authed) return redirectToLogin(res);
+        if (!order) return html(res, 404, this._messagePage('Order not found.'));
+        if (this.portalAcceptMode === 'two_step') {
+          // List already opened confirm in real flow; asis GET alone settles here
+          // when we model one-shot (standalone) — for two_step return confirm UI
+          // only if still available, else settle like production one-shot bots.
+        }
+        const r = this._tryAccept(orderId, sessionUser, 'portal_asis');
+        if (r.ok) return html(res, 200, this._acceptSuccessPage(orderId));
+        if (r.reason === 'taken')
+          return html(res, 200, this._messagePage(`Order ${orderId} is no longer available.`));
+        return html(res, 404, this._messagePage(`Order ${orderId} not found.`));
+      }
+      if (req.method === 'POST') {
+        if (!authed) return redirectToLogin(res);
+        const body = await readForm(req);
+        if (!this.issuedViewstate.has(body.__VIEWSTATE) || !this.issuedEventval.has(body.__EVENTVALIDATION)) {
+          return html(res, 200, this._messagePage('Your session has expired. Please refresh.'));
+        }
+        const imageTarget = Object.keys(body).find((k) => k.endsWith('.x'))?.slice(0, -2) || '';
+        const target = body.__EVENTTARGET || imageTarget || Object.keys(body).find((k) => /accept/i.test(k)) || '';
+        const fromBody =
+          body.__EVENTARGUMENT || extractOrderFromTarget(target) || extractOrderFromTarget(JSON.stringify(body));
+        const id = fromBody || orderId;
+        const r = this._tryAccept(id, sessionUser, 'portal_two_step');
+        if (r.ok) return html(res, 200, this._acceptSuccessPage(id));
+        if (r.reason === 'taken')
+          return html(res, 200, this._messagePage(`Order ${id} is no longer available.`));
+        return html(res, 404, this._messagePage(`Order ${id} not found.`));
+      }
     }
 
     // Status page (verifier)
@@ -392,7 +441,7 @@ export class MockPortal {
           const declineName = `ctl00$cphBody$grdNewOrders$ctl${ctl}$imgBtnDecline$${o.id}`;
           return `
       <tr class="order-row">
-        <td class="order-no">Order no. ${o.id}</td>
+        <td class="order-no">Order no. <a href="ViewAppraisal.aspx?ApprID=${o.apprId}">${o.id}</a></td>
         <td class="address">${o.address}</td>
         <td>
           <input type="image" name="${acceptName}" id="${acceptName.replace(/\$/g, '_')}"
@@ -450,12 +499,18 @@ export class MockPortal {
    * the email Accept/Decline link or via a New Orders list tick (step 1 of 2).
    * Gmail path uses "Accept Order"; portal path uses "Accept Appraisal".
    */
-  _orderDetailsPage(orderId, address = '123 Test St', { acceptLabel = 'Accept Order' } = {}) {
+  _orderDetailsPage(orderId, address = '123 Test St', { acceptLabel = 'Accept Order', formAction } = {}) {
+    const order = this.orders.get(orderId);
+    const apprId = order?.apprId || '0';
+    const action =
+      formAction ||
+      `./AcceptBroadcastAppraisal.aspx?ApprID=${apprId}&Accept=asis`;
+    const actionAttr = action.replace(/&/g, '&amp;');
     return `<!DOCTYPE html><html><head><title>ACCEPT ORDER</title></head><body>
       <h1>ACCEPT ORDER</h1>
       <p>Order no. ${orderId}</p>
       <p>Property Address: ${address}</p>
-      <form method="post" action="/accept.aspx">
+      <form method="post" action="${actionAttr}" id="aspnetForm">
         ${this._stateFields()}
         <input type="hidden" name="__EVENTARGUMENT" value="${orderId}" />
         <input type="submit" name="ctl00$MainContent$btnAccept" value="${acceptLabel}" style="color:green" />

@@ -9,6 +9,38 @@ import { acceptViaPortal } from './portalAccept.js';
 import { tagResult, firstSuccessOrAll } from './race.js';
 import { logger } from '../util/logger.js';
 
+function resolveVerifyRetryCount() {
+  const n = Number(process.env.VERIFY_RETRY_COUNT);
+  return Number.isFinite(n) && n >= 0 ? n : 3;
+}
+
+function resolveVerifyRetryMs() {
+  const n = Number(process.env.VERIFY_RETRY_MS);
+  return Number.isFinite(n) && n >= 0 ? n : 400;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * After a soft/optimistic submit the portal often lags (In Progress not yet
+ * showing our assignment). One unknown pass used to become unverified and
+ * release the lock while a later read would have said accepted — retry briefly.
+ */
+async function verifyWithRetries(verify, orderId, { optimistic, log }) {
+  let verified = await verify(orderId);
+  if (!optimistic || verified !== 'unknown') return verified;
+  const retries = resolveVerifyRetryCount();
+  const delayMs = resolveVerifyRetryMs();
+  for (let i = 0; i < retries && verified === 'unknown'; i++) {
+    if (delayMs > 0) await sleep(delayMs);
+    verified = await verify(orderId);
+    log.info('verify retry after soft submit', { orderId, attempt: i + 2, verified });
+  }
+  return verified;
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.orderId
@@ -96,7 +128,7 @@ export async function executeAccept({
   if (verify) {
     const verifyStartedAt = process.hrtime.bigint();
     try {
-      verified = await verify(orderId);
+      verified = await verifyWithRetries(verify, orderId, { optimistic, log });
       log.info('final portal confirmation', { orderId, verified });
       const neverActed = Object.values(paths).every(
         (p) => !p || ['not_found', 'needs_login', 'no_path'].includes(p.outcome)

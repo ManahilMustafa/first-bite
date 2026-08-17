@@ -104,15 +104,31 @@ test('portal two-step: list Accept then confirmation-page Accept', async () => {
   portal.addOrder('266-03350', { address: '221 N ORR AVE BENSON AZ 85602' });
   portal.portalAcceptMode = 'two_step';
   const s = session();
-  const r = await acceptViaPortal({ session: s, orderId: '266-03350' });
+  // Disable early asis so we exercise list → confirm (production fallback path).
+  const r = await acceptViaPortal({ session: s, orderId: '266-03350', earlyAsIs: false });
   assert.equal(r.ok, true);
   assert.equal(r.outcome, 'accepted');
-  assert.deepEqual(r.steps, ['list_postback', 'details_postback']);
+  assert.ok(
+    r.steps?.[0] === 'list_postback' && (r.steps?.[1] === 'details_get' || r.steps?.[1] === 'details_postback'),
+    `expected list+confirm steps, got ${JSON.stringify(r.steps)}`
+  );
   assert.equal(portal.orderStatus('266-03350'), 'accepted');
   assert.ok(
-    portal.acceptAttempts.some((a) => /two_step/.test(a.via) && a.won),
-    'order must be won on the confirmation-page post, not the list click'
+    portal.acceptAttempts.some((a) => (/two_step|asis/.test(a.via)) && a.won),
+    'order must be won on the confirmation step, not the list click'
   );
+  s.close();
+});
+
+test('portal early Accept=asis from list ApprID (competitor one-shot)', async () => {
+  portal.addOrder('266-03360', { address: '7208 E JEMATELL LN SCOTTSDALE AZ 85266' });
+  const s = session();
+  const r = await acceptViaPortal({ session: s, orderId: '266-03360', earlyAsIs: true });
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome, 'accepted');
+  assert.deepEqual(r.steps, ['early_asis_get']);
+  assert.equal(portal.orderStatus('266-03360'), 'accepted');
+  assert.ok(portal.acceptAttempts.some((a) => a.via === 'portal_asis' && a.won));
   s.close();
 });
 
@@ -140,7 +156,7 @@ test('portal postback reports taken when order is taken mid-flight (race)', asyn
   portal._onBeforeAccept = (id) => {
     if (id === '266-03335') portal._tryAccept(id, 'rival', 'portal');
   };
-  const r = await acceptViaPortal({ session: s, orderId: '266-03335' });
+  const r = await acceptViaPortal({ session: s, orderId: '266-03335', earlyAsIs: false });
   assert.equal(r.ok, false);
   assert.equal(r.outcome, 'taken');
   s.close();
@@ -202,7 +218,12 @@ test('reuseCachedPage: stale cached tokens fall back to a fresh GET+POST and sti
   portal.issuedEventval.clear();
 
   const getsBefore = portal.requests.filter((r) => r.path === '/AppraiserDashboard.aspx' && r.method === 'GET').length;
-  const r = await acceptViaPortal({ session: s, orderId: '266-04001', reuseCachedPage: true });
+  const r = await acceptViaPortal({
+    session: s,
+    orderId: '266-04001',
+    reuseCachedPage: true,
+    earlyAsIs: false,
+  });
   const getsAfter = portal.requests.filter((r) => r.path === '/AppraiserDashboard.aspx' && r.method === 'GET').length;
 
   assert.equal(r.ok, true, 'fell back to a fresh GET+POST and still accepted the order');
@@ -285,6 +306,26 @@ test('executor reports taken when nobody can accept', async () => {
   s.close();
 });
 
+test('executor claims win when verify=accepted after confirm timeout/error path', async () => {
+  // Reproduces 268-08298: we clicked, confirm timed out, verify later saw accepted.
+  const s = session();
+  const r = await executeAccept({
+    orderId: '266-03370',
+    session: s,
+    portalAcceptFn: async () => ({
+      ok: false,
+      outcome: 'error',
+      reason: 'confirm timeout',
+      steps: ['list_postback', 'details_timeout'],
+    }),
+    verify: async () => 'accepted',
+  });
+  assert.equal(r.accepted, true);
+  assert.equal(r.outcome, 'accepted');
+  assert.equal(r.via, 'verified');
+  s.close();
+});
+
 test('executor does NOT invent accepted when every path missed and verify is wrong', async () => {
   // Reproduces the 2026-07-21 production lie: portal path returns not_found
   // (couldn't locate the Accept control), then a flaky verifier matching nav
@@ -296,7 +337,7 @@ test('executor does NOT invent accepted when every path missed and verify is wro
     orderId: '266-03335',
     // Force portal-only, and make locate fail so the path never acts.
     session: s,
-    portalOpts: { locateAccept: () => null },
+    portalOpts: { locateAccept: () => null, earlyAsIs: false },
     verify: lyingVerify,
   });
   assert.equal(r.accepted, false, 'must not claim a win when no path clicked Accept');
@@ -320,18 +361,59 @@ test('executor does NOT claim accept when verify still shows available', async (
 });
 
 test('executor does NOT claim accept on optimistic submitted + verify unknown', async () => {
-  portal.addOrder('266-03338');
-  const s = session();
-  const r = await executeAccept({
-    orderId: '266-03338',
-    session: s,
-    portalAcceptFn: async () => ({ ok: true, outcome: 'submitted', status: 200 }),
-    verify: async () => 'unknown',
-  });
-  assert.equal(r.accepted, false, 'soft 2xx without verify must not become accepted');
-  assert.equal(r.outcome, 'unverified');
-  assert.equal(portal.orderStatus('266-03338'), 'available');
-  s.close();
+  const prevCount = process.env.VERIFY_RETRY_COUNT;
+  process.env.VERIFY_RETRY_COUNT = '0';
+  try {
+    portal.addOrder('266-03338');
+    const s = session();
+    const r = await executeAccept({
+      orderId: '266-03338',
+      session: s,
+      portalAcceptFn: async () => ({ ok: true, outcome: 'submitted', status: 200 }),
+      verify: async () => 'unknown',
+    });
+    assert.equal(r.accepted, false, 'soft 2xx without verify must not become accepted');
+    assert.equal(r.outcome, 'unverified');
+    assert.equal(portal.orderStatus('266-03338'), 'available');
+    s.close();
+  } finally {
+    if (prevCount === undefined) delete process.env.VERIFY_RETRY_COUNT;
+    else process.env.VERIFY_RETRY_COUNT = prevCount;
+  }
+});
+
+test('executor retries verify after soft submit until accepted (portal lag)', async () => {
+  const prevCount = process.env.VERIFY_RETRY_COUNT;
+  const prevMs = process.env.VERIFY_RETRY_MS;
+  process.env.VERIFY_RETRY_COUNT = '3';
+  process.env.VERIFY_RETRY_MS = '10';
+  try {
+    const s = session();
+    let calls = 0;
+    const r = await executeAccept({
+      orderId: '266-03381',
+      session: s,
+      portalAcceptFn: async () => ({
+        ok: true,
+        outcome: 'submitted',
+        status: 0,
+        steps: ['early_asis_get', 'details_postback'],
+      }),
+      verify: async () => {
+        calls++;
+        return calls < 3 ? 'unknown' : 'accepted';
+      },
+    });
+    assert.equal(r.accepted, true);
+    assert.equal(r.outcome, 'accepted');
+    assert.ok(calls >= 3, `expected verify retries, got ${calls}`);
+    s.close();
+  } finally {
+    if (prevCount === undefined) delete process.env.VERIFY_RETRY_COUNT;
+    else process.env.VERIFY_RETRY_COUNT = prevCount;
+    if (prevMs === undefined) delete process.env.VERIFY_RETRY_MS;
+    else process.env.VERIFY_RETRY_MS = prevMs;
+  }
 });
 
 test('executor does NOT mark dashboard Accepted when verify is unknown', async () => {
