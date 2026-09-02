@@ -211,7 +211,88 @@ export class AccountWorker {
     const acted = event.accepted || event.declined || shouldRetainOrderLock(event);
     if (!acted) await this.lock.release(key);
 
+    // shouldRetainOrderLock(event) true here means the portal path already
+    // told us the accept POST likely landed (outcome:'submitted' or it reached
+    // details_postback) — we just couldn't get a fast enough read to prove it.
+    // Left alone, this sits as unverified → pending → FAILED after 30 minutes
+    // even when the order really is ours, because nothing ever asks the
+    // portal again. Keep asking quietly in the background; a later 'accepted'
+    // read is recorded as a corrective event, and computeFinalStatus already
+    // treats a success on ANY attempt as the final word — so the dashboard
+    // self-corrects instead of permanently mis-reporting a real win as lost.
+    if (event.action === 'accept' && !event.accepted && event.outcome === 'unverified' && shouldRetainOrderLock(event)) {
+      this._scheduleUnverifiedRecheck(orderId, {
+        address: meta.address,
+        state: meta.state,
+        zip: meta.zip,
+        account: meta.account,
+        accountId: meta.accountId,
+        forwardingEmail: meta.forwardingEmail,
+      });
+    }
+
     return this._report(event);
+  }
+
+  /**
+   * Background-only: re-poll the portal for an order the hot path couldn't
+   * confirm, and if it turns out to actually be accepted, append a corrective
+   * event. Never blocks handleOrder's return, never retried indefinitely —
+   * bounded attempts/window (default ~10 min) so a genuinely stuck order still
+   * settles to FAILED via the normal PENDING_FRESH_MS timeout instead of
+   * lingering forever.
+   *
+   * Speed protection: this shares the account's one serialized HTTP session
+   * with real accept/decline work (ASP.NET WebForms + one cookie jar can't
+   * take concurrent requests safely — see PortalSession._exclusive). A
+   * recheck tick that happened to be mid-request exactly when a live order
+   * needed accepting would queue behind it and cost real race time. So before
+   * every tick this checks the poller's hold count (the same signal
+   * accept/decline already raises via poller.hold('accept')) and, if a live
+   * accept/decline is in flight, steps aside without spending an attempt —
+   * background verification never gets to compete with a live race.
+   */
+  _scheduleUnverifiedRecheck(orderId, meta, attempts = 20, delayMs = 30000) {
+    const run = async (attemptsLeft) => {
+      if (!this._started || attemptsLeft <= 0) return;
+      await new Promise((r) => setTimeout(r, delayMs));
+      if (!this._started) return;
+
+      if ((this.poller?._holds || 0) > 0) {
+        this.log.debug('unverified recheck: live accept/decline in flight — stepping aside', { orderId });
+        return run(attemptsLeft); // doesn't cost an attempt, just waits for the next tick
+      }
+
+      let verified;
+      try {
+        verified = await this.verify(orderId);
+      } catch (e) {
+        this.log.warn('unverified recheck: verify threw', { orderId, err: String(e) });
+        return run(attemptsLeft - 1);
+      }
+
+      if (verified === 'accepted') {
+        this.log.info('unverified recheck: portal now confirms accepted', { orderId });
+        this.stats.accepted++;
+        this._report({
+          ...meta,
+          orderId,
+          action: 'accept',
+          accepted: true,
+          declined: false,
+          outcome: 'accepted',
+          via: 'verify-recheck',
+          detectedAt: Date.now(),
+        });
+        return;
+      }
+      if (verified === 'taken') {
+        this.log.info('unverified recheck: portal confirms another vendor took it', { orderId });
+        return;
+      }
+      return run(attemptsLeft - 1);
+    };
+    run(attempts).catch((e) => this.log.warn('unverified recheck crashed', { orderId, err: String(e) }));
   }
 
   _report(event) {
