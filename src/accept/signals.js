@@ -5,8 +5,14 @@
 // 2026-07-21 / 2026-07-24 fake-accept bugs.
 //
 // Tuned to the real vendor flow the owner documented:
-//   Gmail → ACCEPT ORDER link → "Accept Order" button → green acceptance badge
-//   Portal → list tick → "Accept Appraisal" button → order detail / in-progress
+//   Gmail → ACCEPT ORDER link → "Accept Order" button → green badge OR order detail
+//   Portal → list tick → "Accept Appraisal" button → green badge OR order detail
+// Neither landing page is exclusive to one path (owner-confirmed 2026-09-03) —
+// both accept flows can end on either the green acceptance badge or the plain
+// "Manage Order" detail page (Status: In Progress next to the order's own
+// number, no banner). The order-detail match is order-id-scoped
+// (classifyNearOrder in verifier.js), not part of the whole-page ACCEPTED_RE
+// below, precisely so it stays strict per the warning above.
 
 import { findPostbackTarget } from '../portal/aspnet.js';
 

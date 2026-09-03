@@ -88,6 +88,32 @@ test('email link two-step: details page then green Accept button', async () => {
   assert.equal(portal.orderStatus('266-03335'), 'accepted');
 });
 
+// Owner-confirmed real portal behavior (2026-09-03): the email path can ALSO
+// land directly on the no-banner "Manage Order" detail page instead of the
+// green badge (neither page is exclusive to one accept path — see
+// signals.js). Bypasses the mock portal (which always renders a badge on
+// success) with a hand-built response, same style as the portalAccept.js
+// no-banner test.
+test('email link recognizes the no-banner order-detail page when no confirm button is present', async () => {
+  const orderId = '266-09999';
+  const manageOrderHtml = `<html><body>
+    <h4>MANAGE ORDER: ${orderId}</h4>
+    <table>
+      <tr><td>Order Number</td><td>${orderId}</td></tr>
+      <tr><td>Status</td><td><span class="badge">In Progress</span></td></tr>
+    </table>
+  </body></html>`;
+  const fakeHttp = {
+    get: async (url) => ({ status: 200, url, body: manageOrderHtml, durationMs: 10 }),
+  };
+  const r = await acceptViaEmailLink({
+    acceptUrl: `https://fake-portal/AcceptOrder.aspx?ApprID=${orderId}`,
+    http: fakeHttp,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome, 'accepted');
+});
+
 // ── Path B: portal postback ─────────────────────────────────────────────────--
 test('portal postback accepts via VIEWSTATE replay', async () => {
   portal.addOrder('266-03335');

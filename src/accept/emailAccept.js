@@ -3,7 +3,10 @@
 // Real E-Street Gmail flow (owner-confirmed):
 //   1. GET the green ACCEPT ORDER link → confirmation page.
 //   2. Click green "Accept Order" (not "Accept Appraisal" — that is portal).
-//   3. Loading, then a green acceptance badge / success copy.
+//   3. Loading, then EITHER a green acceptance badge OR the same no-banner
+//      "Manage Order" detail page the portal path can land on (owner-
+//      confirmed 2026-09-03: neither page is exclusive to one path) — see
+//      classifyNearOrder in verifier.js for the order-detail-page match.
 //
 // Also supports: standalone GET accept, login bounce + one re-auth retry.
 import { HttpClient, formEncode } from '../util/httpClient.js';
@@ -17,6 +20,7 @@ import { logger } from '../util/logger.js';
 import { snippet } from '../portal/session.js';
 import { dumpAcceptDiagnostic } from './diagnostic.js';
 import { findConfirmAcceptControl, looksAccepted, looksLikePortalError, looksTaken } from './signals.js';
+import { classifyNearOrder } from './verifier.js';
 
 /**
  * @param {object} opts
@@ -44,6 +48,7 @@ export async function acceptViaEmailLink({
   const done = (result) => finish(startedAt, { ...result, reauthed, otpFetched: !!session?._lastLoginUsedOtp });
 
   log.info('accept attempt', { acceptUrl });
+  const orderId = orderIdFromUrl(acceptUrl);
 
   for (;;) {
     const first = await client.get(acceptUrl, { followRedirects: true });
@@ -74,7 +79,7 @@ export async function acceptViaEmailLink({
     if (looksTaken(body)) {
       return done({ ok: false, outcome: 'taken', status: first.status, bounced: false, steps });
     }
-    if (isAcceptedResponse(body, first.status)) {
+    if (isAcceptedResponse(body, first.status, orderId)) {
       log.info('accept successful', { acceptUrl, via: 'email', steps });
       return done({ ok: true, outcome: 'accepted', status: first.status, bounced: false, steps });
     }
@@ -85,7 +90,15 @@ export async function acceptViaEmailLink({
       pb = findPostbackTarget(body, acceptLabel);
     }
     if (!pb) {
-      dumpAcceptDiagnostic({ orderId: orderIdFromUrl(acceptUrl), stage: 'email_no_accept_btn', html: body, url: pageUrl });
+      dumpAcceptDiagnostic({ orderId, stage: 'email_no_accept_btn', html: body, url: pageUrl });
+      // No confirm button and not a recognized badge — before assuming
+      // 'submitted'/'unknown', check whether we actually landed straight on
+      // the no-banner order-detail page (owner-confirmed 2026-09-03: the
+      // portal path shows this instead of a badge; the email path can too).
+      if (classifyNearOrder(body, orderId) === 'accepted') {
+        log.info('accept successful', { acceptUrl, via: 'email', steps, matched: 'order-detail page' });
+        return done({ ok: true, outcome: 'accepted', status: first.status, bounced: false, steps });
+      }
       const ok = first.status >= 200 && first.status < 300;
       if (!ok) {
         log.error('accept failed: unrecognized response', { acceptUrl, status: first.status, bodySnippet: snippet(body) });
@@ -152,17 +165,22 @@ export async function acceptViaEmailLink({
         bodySnippet: snippet(resp),
       });
     }
-    if (isAcceptedResponse(resp, second.status)) {
+    if (isAcceptedResponse(resp, second.status, orderId)) {
       log.info('accept successful', { acceptUrl, via: 'email', steps });
       return done({ ok: true, outcome: 'accepted', status: second.status, bounced: false, steps });
     }
 
     dumpAcceptDiagnostic({
-      orderId: orderIdFromUrl(acceptUrl),
+      orderId,
       stage: 'email_post_accept',
       html: resp,
       url: second.url || postUrl,
     });
+    // Same no-banner order-detail check as the first-GET branch above.
+    if (classifyNearOrder(resp, orderId) === 'accepted') {
+      log.info('accept successful', { acceptUrl, via: 'email', steps, matched: 'order-detail page' });
+      return done({ ok: true, outcome: 'accepted', status: second.status, bounced: false, steps });
+    }
     {
       const ok = second.status >= 200 && second.status < 300;
       if (!ok) {
@@ -198,8 +216,8 @@ async function reauthenticate(session, log, acceptUrl) {
   return true;
 }
 
-function isAcceptedResponse(body, status) {
-  return status >= 200 && status < 300 && looksAccepted(body);
+function isAcceptedResponse(body, status, orderId) {
+  return status >= 200 && status < 300 && (looksAccepted(body) || classifyNearOrder(body, orderId) === 'accepted');
 }
 
 function orderIdFromUrl(url) {
