@@ -533,8 +533,27 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
     })),
   ]);
   if (postResult.timedOut) {
-    // Leave postPromise running (session exclusive holds until it settles).
-    postPromise.catch(() => {});
+    // Leave postPromise running (session exclusive holds until it settles) —
+    // but don't just discard what it eventually comes back with. This is the
+    // real post-accept page (owner-confirmed: no green success banner on this
+    // path, just the order detail / in-progress view — see signals.js), and
+    // up to now it was thrown away unread the moment it arrived. Log + dump it
+    // so an "unverified" case has real evidence instead of needing verify()'s
+    // separate, slower re-fetch (or the background recheck) to find out.
+    postPromise
+      .then((late) => {
+        const body = late?.body || '';
+        const accepted = looksAccepted(body);
+        const taken = looksTaken(body);
+        dumpAcceptDiagnostic({ orderId, stage: 'portal_late_confirm_resolved', html: body, url: late?.url || absPostUrl });
+        log.info('late confirm POST resolved', {
+          orderId,
+          decisive: accepted || taken,
+          outcome: accepted ? 'accepted' : taken ? 'taken' : 'inconclusive',
+          lateMs: late?.durationMs,
+        });
+      })
+      .catch((e) => log.warn('late confirm POST error', { orderId, err: String(e) }));
     log.warn('accept: confirm POST soft-timeout — leaving request in flight, trusting verify()', {
       orderId,
       postTimeoutMs,

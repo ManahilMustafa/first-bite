@@ -253,8 +253,16 @@ export class AccountWorker {
    * background verification never gets to compete with a live race.
    */
   _scheduleUnverifiedRecheck(orderId, meta, attempts = 20, delayMs = 30000) {
+    this.log.info('unverified recheck: scheduled', { orderId, attempts, delayMs });
     const run = async (attemptsLeft) => {
-      if (!this._started || attemptsLeft <= 0) return;
+      if (!this._started) return;
+      if (attemptsLeft <= 0) {
+        // Silence here previously made this indistinguishable from "never ran
+        // at all" — the exact ambiguity that made a real incident (269-00701/
+        // 269-00737, 2026-09-03) impossible to diagnose after the fact.
+        this.log.warn('unverified recheck: exhausted all attempts, still unresolved — leaving as failed', { orderId });
+        return;
+      }
       await new Promise((r) => setTimeout(r, delayMs));
       if (!this._started) return;
 
@@ -290,6 +298,7 @@ export class AccountWorker {
         this.log.info('unverified recheck: portal confirms another vendor took it', { orderId });
         return;
       }
+      this.log.debug('unverified recheck: still unresolved, retrying', { orderId, attemptsLeft: attemptsLeft - 1 });
       return run(attemptsLeft - 1);
     };
     run(attempts).catch((e) => this.log.warn('unverified recheck crashed', { orderId, err: String(e) }));
