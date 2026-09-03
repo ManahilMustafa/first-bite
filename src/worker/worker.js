@@ -191,7 +191,7 @@ export class AccountWorker {
     }
 
     let event = region.allowed
-      ? await this._accept({ orderId, acceptUrl, source, prefetchedPage })
+      ? await this._accept({ orderId, acceptUrl, source, prefetchedPage, meta })
       : await this._decline({ orderId, declineUrl, source, region, prefetchedPage });
     const totalMs = Date.now() - detectedAt;
     event = {
@@ -232,6 +232,28 @@ export class AccountWorker {
     }
 
     return this._report(event);
+  }
+
+  /**
+   * Append a corrective ACCEPTED event for an order the hot path had already
+   * marked failed/unverified. computeFinalStatus treats a success on ANY
+   * attempt as the final word, so this alone flips the dashboard from failed
+   * to accepted — used both by the background recheck and by the late-
+   * resolving confirm POST (portalAccept.js's onLateConfirmResolved), which
+   * can land within seconds rather than waiting for the next recheck tick.
+   */
+  _reportCorrectiveAccept(orderId, meta, via) {
+    this.stats.accepted++;
+    this._report({
+      ...meta,
+      orderId,
+      action: 'accept',
+      accepted: true,
+      declined: false,
+      outcome: 'accepted',
+      via,
+      detectedAt: Date.now(),
+    });
   }
 
   /**
@@ -281,17 +303,7 @@ export class AccountWorker {
 
       if (verified === 'accepted') {
         this.log.info('unverified recheck: portal now confirms accepted', { orderId });
-        this.stats.accepted++;
-        this._report({
-          ...meta,
-          orderId,
-          action: 'accept',
-          accepted: true,
-          declined: false,
-          outcome: 'accepted',
-          via: 'verify-recheck',
-          detectedAt: Date.now(),
-        });
+        this._reportCorrectiveAccept(orderId, meta, 'verify-recheck');
         return;
       }
       if (verified === 'taken') {
@@ -338,7 +350,7 @@ export class AccountWorker {
     return prefetchedPage;
   }
 
-  async _accept({ orderId, acceptUrl, source, prefetchedPage }) {
+  async _accept({ orderId, acceptUrl, source, prefetchedPage, meta = {} }) {
     this.log.info('accepting in-region order', { orderId, source, hasEmailLink: !!acceptUrl });
     return this._enqueuePortalWork(async () => {
       let released = false;
@@ -357,6 +369,15 @@ export class AccountWorker {
           portalOpts: {
             ...this.portalOpts,
             prefetchedPage: this._takePrefetch(prefetchedPage),
+            // The confirm POST after a soft-timeout used to resolve into the
+            // void — this is the real order-detail page (owner-confirmed
+            // 2026-09-03: no green banner on the portal path, just Status: In
+            // Progress next to this order's own number). If it lands on a
+            // recognizably-accepted page, correct the dashboard immediately
+            // instead of waiting on the next background recheck tick.
+            onLateConfirmResolved: (outcome) => {
+              if (outcome === 'accepted') this._reportCorrectiveAccept(orderId, meta, 'portal-late-confirm');
+            },
           },
           verify: this.verify,
           onAfterRace: releaseHold,

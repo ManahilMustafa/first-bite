@@ -23,6 +23,7 @@ import {
   looksLikePortalError,
   looksTaken,
 } from './signals.js';
+import { classifyNearOrder } from './verifier.js';
 import { acceptAsIsUrl, extractApprIdNearOrder } from './apprId.js';
 
 function resolveEarlyAsIsTimeoutMs() {
@@ -73,6 +74,7 @@ export async function acceptViaPortal({
   earlyAsIs = true,
   earlyAsIsTimeoutMs,
   confirmPostTimeoutMs,
+  onLateConfirmResolved,
 }) {
   const path = newOrdersPath || session.routes.newOrders;
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
@@ -163,6 +165,7 @@ export async function acceptViaPortal({
         earlyAsIsTimeoutMs: resolvedEarlyAsIsTimeoutMs,
         confirmPostTimeoutMs: resolvedConfirmPostTimeoutMs,
         referer: typeof session.url === 'function' ? session.url(path) : path,
+        onLateConfirmResolved,
       });
       if (early) {
         return {
@@ -286,6 +289,7 @@ export async function acceptViaPortal({
         log,
         timeoutMs: httpOpts.timeoutMs,
         confirmPostTimeoutMs: resolvedConfirmPostTimeoutMs,
+        onLateConfirmResolved,
       });
       confirmMs = Number(process.hrtime.bigint() - detailsStarted) / 1e6;
       resp = second.body || '';
@@ -467,7 +471,7 @@ export async function acceptViaPortal({
  *        non-decisive again. Skip straight to the POST rather than paying
  *        another ~100-800ms for an answer we already know.
  */
-async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs, skipGet = false, confirmPostTimeoutMs }) {
+async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, referer, orderId, log, timeoutMs, skipGet = false, confirmPostTimeoutMs, onLateConfirmResolved }) {
   const headers = { referer };
   const httpOpts = Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {};
 
@@ -543,15 +547,23 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
     postPromise
       .then((late) => {
         const body = late?.body || '';
-        const accepted = looksAccepted(body);
-        const taken = looksTaken(body);
+        // Two checks: the strict whole-page signals (green-banner style
+        // wording), and the same order-id-scoped proximity match verify()
+        // already trusts for the no-banner "Manage Order" detail page
+        // (Status: In Progress next to THIS order's own number — owner-
+        // confirmed 2026-09-03 real page, no banner on the portal path).
+        const near = classifyNearOrder(body, orderId);
+        const accepted = looksAccepted(body) || near === 'accepted';
+        const taken = looksTaken(body) || near === 'taken';
         dumpAcceptDiagnostic({ orderId, stage: 'portal_late_confirm_resolved', html: body, url: late?.url || absPostUrl });
+        const outcome = accepted ? 'accepted' : taken ? 'taken' : 'inconclusive';
         log.info('late confirm POST resolved', {
           orderId,
           decisive: accepted || taken,
-          outcome: accepted ? 'accepted' : taken ? 'taken' : 'inconclusive',
+          outcome,
           lateMs: late?.durationMs,
         });
+        if (outcome === 'accepted') onLateConfirmResolved?.('accepted');
       })
       .catch((e) => log.warn('late confirm POST error', { orderId, err: String(e) }));
     log.warn('accept: confirm POST soft-timeout — leaving request in flight, trusting verify()', {
@@ -570,7 +582,7 @@ async function raceConfirmAccept({ session, absPostUrl, postUrl, detailsBody, re
  * One-shot Accept=asis when ApprID is visible on the New Orders HTML.
  * @returns {Promise<object|null>}
  */
-async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, earlyAsIsTimeoutMs, confirmPostTimeoutMs, referer }) {
+async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, earlyAsIsTimeoutMs, confirmPostTimeoutMs, referer, onLateConfirmResolved }) {
   const apprId = extractApprIdNearOrder(html, orderId);
   if (!apprId) return null;
 
@@ -650,6 +662,7 @@ async function tryEarlyAcceptAsIs({ session, orderId, html, log, httpOpts, early
     log,
     timeoutMs: httpOpts.timeoutMs,
     confirmPostTimeoutMs,
+    onLateConfirmResolved,
     // Production diagnostics (268-09741/268-09800/268-09831/268-09929) show
     // the confirm page's own form action IS this exact Accept=asis URL — a
     // second GET here is a guaranteed-redundant repeat of the read we just

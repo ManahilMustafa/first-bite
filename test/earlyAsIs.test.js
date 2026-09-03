@@ -190,6 +190,63 @@ test('a hanging confirm POST soft-times out at confirmPostTimeoutMs and trusts v
   assert.deepEqual(result.steps, ['early_asis_get', 'details_postback']);
 });
 
+// Owner-confirmed real portal behaviour (2026-09-03): after a successful
+// portal-path accept there is NO green success banner — the confirm POST
+// eventually lands on a plain "Manage Order: <id>" detail page showing
+// Status: In Progress next to that order's own number. That page used to be
+// thrown away unread the moment the soft-timeout fired; onLateConfirmResolved
+// is how the caller (AccountWorker) finds out once it actually arrives.
+test('a late-resolving confirm POST that lands on the no-banner order-detail page still reports accepted via onLateConfirmResolved', async () => {
+  const POST_TIMEOUT_MS = 100;
+  const LATE_RESOLVE_MS = 250;
+  const manageOrderHtml = `<html><body>
+    <h4>MANAGE ORDER: ${ORDER_ID}</h4>
+    <table>
+      <tr><td>Order Number</td><td>${ORDER_ID}</td></tr>
+      <tr><td>Status</td><td><span class="badge">In Progress</span></td></tr>
+    </table>
+  </body></html>`;
+
+  const session = {
+    url: (path) => `http://fake-portal${path}`,
+    routes: { newOrders: '/AppraiserDashboard.aspx' },
+    http: {
+      get: (url) => {
+        if (url.includes('AcceptBroadcastAppraisal.aspx')) {
+          return Promise.resolve({ status: 200, url, body: CONFIRM_UI_HTML, durationMs: 20 });
+        }
+        return Promise.reject(new Error('unexpected GET ' + url));
+      },
+    },
+    authedGet: () => Promise.reject(new Error('authedGet should not be called in this test')),
+    authedPost: (path) =>
+      new Promise((resolve) =>
+        setTimeout(() => resolve({ status: 200, url: path, body: manageOrderHtml, durationMs: LATE_RESOLVE_MS }), LATE_RESOLVE_MS)
+      ),
+  };
+
+  const lateOutcomes = [];
+  const result = await acceptViaPortal({
+    session,
+    orderId: ORDER_ID,
+    prefetchedPage: { body: NEW_ORDERS_HTML, status: 200, url: 'http://fake-portal/AppraiserDashboard.aspx' },
+    log: silentLog(),
+    earlyAsIs: true,
+    confirmPostTimeoutMs: POST_TIMEOUT_MS,
+    onLateConfirmResolved: (outcome) => lateOutcomes.push(outcome),
+  });
+
+  // Soft-timeout still fires on schedule — the hot path is unaffected.
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'submitted');
+  assert.deepEqual(lateOutcomes, [], 'callback must not fire before the late POST actually resolves');
+
+  // Give the backgrounded POST time to resolve and get classified.
+  await new Promise((r) => setTimeout(r, LATE_RESOLVE_MS + 150));
+
+  assert.deepEqual(lateOutcomes, ['accepted'], 'the no-banner order-detail page must be recognized as accepted');
+});
+
 test('early Accept=asis confirm step skips the redundant second GET when the form action is the same URL', async () => {
   let getCallsToAcceptUrl = 0;
   let postCalls = 0;
