@@ -98,14 +98,17 @@ test('a slower check finishing after a faster one already confirmed success does
   const tl = buildOrderTimeline(events);
   const labels = tl.map((t) => t.label);
   assert.ok(labels.some((l) => /Accept succeeded/.test(l)));
+  // Owner call (2026-09-05): don't explain the superseded check away with a
+  // footnote either — a non-technical reader shouldn't see "not confirmed"
+  // at all once the order is genuinely accepted. Drop the line entirely.
   assert.ok(
-    !labels.some((l) => /^Accept did not succeed/.test(l)),
-    'must not end on a bare "did not succeed" once the order is confirmed accepted elsewhere'
+    !labels.some((l) => /did not succeed|inconclusive/i.test(l)),
+    'a superseded check must not surface any "did not succeed"/"inconclusive" line once the order is confirmed accepted elsewhere'
   );
-  assert.ok(
-    labels.some((l) => /inconclusive.*confirmed accepted by a different check/.test(l)),
-    'the superseded check should say so, not read as a plain failure'
-  );
+  // The neutral factual steps from the slower attempt are still fine to show
+  // (they're not confusing on their own) — only its final verdict is dropped.
+  assert.ok(labels.some((l) => /Portal Attempt started/.test(l)));
+  assert.ok(labels.some((l) => /Portal result: submitted/.test(l)));
 });
 
 test('timeline labels never leak raw internal outcome codes verbatim without translation', () => {

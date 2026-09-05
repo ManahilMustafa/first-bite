@@ -73,12 +73,16 @@ function attemptTimeline(e, { orderAccepted, orderDeclined } = {}) {
 
   const succeeded = !!(e.accepted || e.declined);
   const supersededByAnotherCheck = !succeeded && (e.action === 'decline' ? orderDeclined : orderAccepted);
-  const pastTense = e.action === 'decline' ? 'declined' : 'accepted';
+  // A superseded check's own "did not succeed" is real to the bot but reads
+  // as a contradiction to a non-technical reader once the order is already
+  // confirmed elsewhere — owner call: don't show it at all rather than
+  // explain it away. The order's own final status (shown separately) is the
+  // single source of truth; this per-attempt line only matters when it IS
+  // the truth.
+  if (supersededByAnotherCheck) return entries;
   const label = succeeded
     ? `${verb} succeeded (${friendlyOutcome(e.outcome)})`
-    : supersededByAnotherCheck
-      ? `${verb} check here was inconclusive (${friendlyOutcome(e.outcome)}) — order was confirmed ${pastTense} by a different check`
-      : `${verb} did not succeed (${friendlyOutcome(e.outcome)})`;
+    : `${verb} did not succeed (${friendlyOutcome(e.outcome)})`;
   entries.push({ ts: attemptEnd + 1, label });
   return entries;
 }
