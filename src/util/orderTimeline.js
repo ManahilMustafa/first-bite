@@ -9,14 +9,23 @@
  * @returns {{ts:number, label:string}[]}  chronological technical timeline
  */
 export function buildOrderTimeline(events) {
+  // A slower, independent check (e.g. the original hot-path verify()) can
+  // finish AFTER a faster one already confirmed success (e.g. the late
+  // confirm-POST capture) — both write their own event row, so the raw
+  // per-attempt trail can end on a "did not succeed" line for an order that
+  // is, overall, genuinely accepted/declined. That's not a contradiction,
+  // just two checks settling at different times, but read top-to-bottom it
+  // looks like one. Tell attemptTimeline the real outcome so it can say so.
+  const orderAccepted = events.some((e) => e.accepted);
+  const orderDeclined = events.some((e) => e.declined);
   const entries = [];
   for (const e of [...events].sort((a, b) => (a.ts || 0) - (b.ts || 0))) {
-    entries.push(...attemptTimeline(e));
+    entries.push(...attemptTimeline(e, { orderAccepted, orderDeclined }));
   }
   return entries.sort((a, b) => a.ts - b.ts);
 }
 
-function attemptTimeline(e) {
+function attemptTimeline(e, { orderAccepted, orderDeclined } = {}) {
   const entries = [];
   const sourceLabel = e.source === 'portal' ? 'portal poll' : e.source === 'gmail' ? 'inbox email' : e.source || 'detector';
   entries.push({ ts: e.ts, label: `Detected via ${sourceLabel}` });
@@ -63,10 +72,14 @@ function attemptTimeline(e) {
   }
 
   const succeeded = !!(e.accepted || e.declined);
-  entries.push({
-    ts: attemptEnd + 1,
-    label: `${verb} ${succeeded ? 'succeeded' : 'did not succeed'} (${friendlyOutcome(e.outcome)})`,
-  });
+  const supersededByAnotherCheck = !succeeded && (e.action === 'decline' ? orderDeclined : orderAccepted);
+  const pastTense = e.action === 'decline' ? 'declined' : 'accepted';
+  const label = succeeded
+    ? `${verb} succeeded (${friendlyOutcome(e.outcome)})`
+    : supersededByAnotherCheck
+      ? `${verb} check here was inconclusive (${friendlyOutcome(e.outcome)}) — order was confirmed ${pastTense} by a different check`
+      : `${verb} did not succeed (${friendlyOutcome(e.outcome)})`;
+  entries.push({ ts: attemptEnd + 1, label });
   return entries;
 }
 
