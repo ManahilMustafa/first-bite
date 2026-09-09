@@ -352,7 +352,8 @@ input {
 
 .worker-stats {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -920,7 +921,8 @@ input {
 /* Orders + Accounts tables -> stacked cards on narrow screens */
 @media (max-width: 720px) {
   .orders-table thead,
-  .accounts-table thead {
+  .accounts-table thead,
+  .stats-table thead {
     display: none;
   }
 
@@ -931,7 +933,11 @@ input {
   .accounts-table,
   .accounts-table tbody,
   .accounts-table tr,
-  .accounts-table td {
+  .accounts-table td,
+  .stats-table,
+  .stats-table tbody,
+  .stats-table tr,
+  .stats-table td {
     display: block;
     width: 100%;
   }
@@ -941,25 +947,29 @@ input {
   }
 
   .orders-table tr,
-  .accounts-table tr {
+  .accounts-table tr,
+  .stats-table tr {
     padding: 14px 16px;
     border-bottom: 1px solid var(--border);
   }
 
   .orders-table td,
-  .accounts-table td {
+  .accounts-table td,
+  .stats-table td {
     padding: 6px 0;
     border-bottom: none;
     max-width: none;
   }
 
   .orders-table td.empty-cell,
-  .accounts-table td.empty-cell {
+  .accounts-table td.empty-cell,
+  .stats-table td.empty-cell {
     padding: 40px 0 !important;
   }
 
   .orders-table td[data-label]::before,
-  .accounts-table td[data-label]::before {
+  .accounts-table td[data-label]::before,
+  .stats-table td[data-label]::before {
     content: attr(data-label);
     display: block;
     font-size: 11px;
@@ -1063,6 +1073,9 @@ input {
 
 .order-timeline-label {
   color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: break-word;
 }
 
 .timeline-empty {

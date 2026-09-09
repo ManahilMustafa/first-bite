@@ -67,7 +67,7 @@ export function Stats() {
 
       <section className="panel panel-flush">
         <div className="table-wrap">
-          <table className="data-table">
+          <table className="data-table stats-table">
             <thead>
               <tr>
                 <th>User</th>
@@ -87,11 +87,11 @@ export function Stats() {
               ) : (
                 rows.map((a) => (
                   <tr key={a.accountId || a.label}>
-                    <td><strong>{a.label}</strong></td>
-                    <td><Cell w={a.day} /></td>
-                    <td><Cell w={a.week} /></td>
-                    <td><Cell w={a.month} /></td>
-                    <td><Cell w={a.total} /></td>
+                    <td data-label="User"><strong>{a.label}</strong></td>
+                    <td data-label="Today (24h)"><Cell w={a.day} /></td>
+                    <td data-label="This week (7d)"><Cell w={a.week} /></td>
+                    <td data-label="This month (30d)"><Cell w={a.month} /></td>
+                    <td data-label="All time"><Cell w={a.total} /></td>
                   </tr>
                 ))
               )}
